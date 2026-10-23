@@ -78,11 +78,14 @@ jobs:
         shell: pwsh
         run: |
           choco install nsis -y --no-progress
-          $env:Path += ";$env:ProgramFiles\NSIS"
+          $mk = Get-ChildItem "C:\Program Files*\NSIS\makensis.exe" -ErrorAction SilentlyContinue |
+                Select-Object -First 1 -ExpandProperty FullName
+          if (-not $mk) { throw "makensis not found after choco install" }
+          Write-Host "makensis: $mk"
           $ver = "${{ steps.ver.outputs.version }}"
           $bytes = (Get-ChildItem deploy -Recurse -File | Measure-Object Length -Sum).Sum
           $kb = [int]($bytes / 1KB)
-          makensis /INPUTCHARSET UTF8 /DVERSION=$ver /DPAYLOAD="$env:GITHUB_WORKSPACE\deploy" `
+          & $mk /INPUTCHARSET UTF8 /DVERSION=$ver /DPAYLOAD="$env:GITHUB_WORKSPACE\deploy" `
             /DOUTFILE="$env:GITHUB_WORKSPACE\Hox-Setup-$ver.exe" /DESTSIZE=$kb `
             /DASSETS="$env:GITHUB_WORKSPACE\installer\assets" installer\hox-setup-cpp.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
