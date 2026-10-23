@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Hox Launcher v3.1 — проверка целостности + установка строго по кнопке.
+Hox Launcher v3.5 — проверка целостности + установка строго по кнопке.
 
 Схема «лаунчер отдельно — плеер отдельно» (v0.4.0+, поведение v3.1):
   * установщик Hox-Setup-*.exe ставит ТОЛЬКО лаунчер (runtime Python +
@@ -30,12 +30,16 @@ Hox Launcher v3.1 — проверка целостности + установк
     корневые сертификаты Windows 7), скачивание повторяется без неё;
   * перед обновлением сам закрывает запущенный плеер;
   * пока плеер запущен, кнопки запуска неактивны (опрос player.lock, v0.4.4);
+  * v0.4.5: пока плеер запущен, окно лаунчера сворачивается в трей,
+    при закрытии плеера — разворачивается обратно; крестик оставляет
+    лаунчер работать в значке трея (выход — меню значка); повторный
+    запуск лаунчера разворачивает первое окно;
   * никаких консольных окон (CREATE_NO_WINDOW, pythonw.exe).
 
 Совместимость: PyQt6 на Win8.1/10/11 и fake-PyQt6 (PyQt5) на Win7 SP1
 (Python 3.8) — синтаксис ограничен 3.8, только scoped-энумы.
 
-Версия: 3.4 (релиз плеера 0.4.4)
+Версия: 3.5 (релиз плеера 0.4.5)
 """
 
 import os
@@ -46,6 +50,7 @@ import time
 import hashlib
 import zipfile
 import shutil
+import socket
 import ssl
 import tempfile
 import subprocess
@@ -54,7 +59,7 @@ import urllib.error
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, Tuple
 
-LAUNCHER_VERSION = "3.4"
+LAUNCHER_VERSION = "3.5"
 APP_TITLE = "Hox — Лаунчер"
 PLAYER_SCRIPT = "hox_music_player.py"
 # Манифест целостности: SHA-256 установленных файлов плеера; пишется при
@@ -84,6 +89,14 @@ PLAYER_EXE_NAMES = ("Hox.exe", "pythonw.exe")
 PLAYER_LOCK_NAME = "player.lock"
 PLAYER_POLL_MS = 2000        # период опроса состояния плеера
 PS_SWEEP_SEC = 15.0          # период фоновой проверки процессов (PowerShell)
+
+# v0.4.5 (лаунчер 3.5): поведение окна и трея.
+# Пока плеер запущен, окно лаунчера сворачивается в системный трей,
+# при закрытии плеера — разворачивается обратно. Закрытие окна (крестик)
+# не завершает лаунчер: он продолжает работать в значке трея
+# (настоящий выход — пункт «Выход» в меню значка). Повторный запуск
+# лаунчера не создаёт вторую копию — разворачивает первое окно.
+SINGLE_PORTS = (46121, 46122, 46123)  # TCP на 127.0.0.1: «уже запущен»
 # Однострочник: PID процессов плеера (в cmdline есть hox_music_player).
 # Get-CimInstance — Win8.1/10/11; на Win7 (PS 2.0, без CIM) — wmic.
 PS_PLAYER_PIDS_CMD = (
@@ -134,6 +147,11 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # с GitHub показываются поверх этого списка)
 # ------------------------------------------------------------------
 NEWS: List[Tuple[str, List[str]]] = [
+    ("0.4.5", [
+        "Лаунчер сам уходит в трей, пока играет музыка: как только плеер запущен, окно сворачивается в значок в системном трее, а когда плеер закрыт — лаунчер сам разворачивается обратно.",
+        "Крестик больше не выключает лаунчер: он продолжает работать в трее — запуск плеера, проверка обновлений и настоящий выход доступны из меню значка; при первом сворачивании показывается подсказка.",
+        "Повторный запуск лаунчера (ярлык «Hox») не открывает вторую копию — разворачивается уже открытое окно, даже если оно свернуто в трей.",
+    ]),
     ("0.4.4", [
         "Пока плеер запущен, кнопки «Запустить плеер» и «Открыть плеер» неактивны — случайный повторный запуск исключён; как только плеер закрыт, кнопки снова активны — лаунчер замечает это сам, без перезапуска.",
         "Лаунчер видит плеера, запущенного откуда угодно: плеер при старте пишет свой PID в файл player.lock в папке установки и убирает его при выходе; для старых установок, где плеер ещё не пишет файл, работает резервная проверка процессов.",
@@ -800,16 +818,81 @@ def count_files(root: Path) -> int:
 
 
 # ------------------------------------------------------------------
+# v0.4.5: одиночный экземпляр лаунчера — повторный запуск (ярлык «Hox»,
+# когда лаунчер свёрнут в трей) разворачивает первое окно, а не создаёт
+# вторую копию. Служебный TCP-порт на 127.0.0.1: первый экземпляр
+# занимает порт, вторая копия отправляет ему «hox-show» и завершается.
+# ------------------------------------------------------------------
+
+def _single_bind():
+    """Занять служебный TCP-порт на 127.0.0.1 (признак первого
+    экземпляра). None — ни один порт занять не удалось."""
+    for port in SINGLE_PORTS:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if os.name == "nt":
+                # на Windows исключающая привязка запрещает двойное
+                # занятие порта вторым экземпляром (SO_REUSEADDR тут
+                # работает наоборот — «увести» уже занятый порт)
+                excl = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+                if excl is not None:
+                    s.setsockopt(socket.SOL_SOCKET, excl, 1)
+            else:
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                except OSError:
+                    pass
+            s.bind(("127.0.0.1", port))
+            s.listen(1)
+            s.setblocking(False)
+            return s
+        except OSError:
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001
+                pass
+    return None
+
+
+def _single_notify_existing() -> bool:
+    """Сообщить запущенному лаунчеру «развернись». True — отправлено."""
+    for port in SINGLE_PORTS:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.6)
+        try:
+            s.connect(("127.0.0.1", port))
+            s.sendall(b"hox-show\n")
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            s.close()
+            return True
+        except OSError:
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001
+                pass
+    return False
+
+
+# ------------------------------------------------------------------
 # Qt-импорты (PyQt6; на Win7 их отдаёт fake-пакет pyqt6_compat)
 # ------------------------------------------------------------------
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QProgressBar, QMessageBox, QFileDialog, QComboBox,
-    QCheckBox, QGroupBox, QScrollArea, QTextEdit, QFrame, QDialog
+    QCheckBox, QGroupBox, QScrollArea, QTextEdit, QFrame, QDialog,
+    QMenu, QSystemTrayIcon
 )
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QTimer, QSettings,
                           QRect, QProcess)
 from PyQt6.QtGui import QPixmap, QPainter, QColor, QLinearGradient, QPen, QFont, QIcon
+# QAction в PyQt6 живёт в QtGui, в PyQt5 (fake-PyQt6 на Win7) — в QtWidgets
+try:
+    from PyQt6.QtGui import QAction  # noqa: F401
+except Exception:  # noqa: BLE001
+    from PyQt6.QtWidgets import QAction  # noqa: F401
 
 
 class _SettingsShim:
@@ -1452,6 +1535,13 @@ class LauncherWindow(QMainWindow):
         self._ps_pids: List[int] = []
         self._ps_sweep_ts = 0.0
         self._ps_proc: Optional[QProcess] = None
+        # v0.4.5 (лаунчер 3.5): трей и одиночный экземпляр
+        self._tray_exit = False          # настоящий выход (меню значка)
+        self._tray_notice_shown = False  # подсказку «в трее» — один раз
+        self.tray: Optional[QSystemTrayIcon] = None
+        self._tray_act_show = None
+        self._tray_act_launch = None
+        self._single_srv = None
 
         central = QWidget()
         if self._scroll_overflow > 0:
@@ -1601,6 +1691,9 @@ class LauncherWindow(QMainWindow):
         self.log_box.setFixedHeight(self._log_h)
         root.addWidget(self.log_box)
 
+        self._make_tray()
+        self.attach_single_listener(_single_bind())
+
         self._fill_dir_combo()
         self.refresh_state()
         self.log("Лаунчер v{} запущен (сборка плеера {})".format(
@@ -1718,6 +1811,9 @@ class LauncherWindow(QMainWindow):
         self.btn_open.setEnabled(act)
         self.btn_open.setToolTip("Плеер уже запущен" if running else "")
         self.btn_check.setEnabled(not self._busy)
+        # v0.4.5: синхронизировать «Запустить плеер» в меню значка трея
+        if self._tray_act_launch is not None:
+            self._tray_act_launch.setEnabled(act)
         if self._pending is not None:
             self.btn_install.setText("⬇  Обновить до v{}".format(
                 self._pending.get("version", "")))
@@ -1738,6 +1834,133 @@ class LauncherWindow(QMainWindow):
         if on:
             self.progress.setValue(0)
         self.refresh_state()
+
+    # ---------- трей и одиночный экземпляр (v0.4.5) ----------
+
+    def _make_tray(self) -> None:
+        """Значок в системном трее: клик — показать/скрыть окно,
+        меню — показать, запустить плеер, выход. Если трея нет
+        (или окружение тестовое), лаунчер работает как раньше."""
+        try:
+            icon = self.windowIcon()
+            if icon.isNull():
+                icon = QIcon(draw_logo(64))
+            tray = QSystemTrayIcon(icon, self)
+            tray.setToolTip(APP_TITLE)
+            menu = QMenu()
+            act_show = QAction("Показать лаунчер", menu)
+            act_show.triggered.connect(self.restore_from_tray)
+            act_launch = QAction("Запустить плеер", menu)
+            act_launch.triggered.connect(self.launch_player)
+            act_quit = QAction("Выход", menu)
+            act_quit.triggered.connect(self.tray_quit)
+            menu.addAction(act_show)
+            menu.addAction(act_launch)
+            menu.addSeparator()
+            menu.addAction(act_quit)
+            tray.setContextMenu(menu)
+            tray.activated.connect(self._on_tray_activated)
+            tray.show()
+            self.tray = tray
+            self._tray_act_show = act_show
+            self._tray_act_launch = act_launch
+        except Exception:  # noqa: BLE001
+            self.tray = None
+            self._tray_act_show = None
+            self._tray_act_launch = None
+
+    def _on_tray_activated(self, reason) -> None:
+        """Клик по значку трея: показать/скрыть окно лаунчера."""
+        try:
+            r = int(reason)
+        except Exception:  # noqa: BLE001
+            return
+        # 3 = Trigger (одинарный клик), 2 = DoubleClick — значения
+        # совпадают в Qt5 и Qt6; числовое сравнение обходит разницу
+        # в доступе к scoped-энумам между версиями
+        if r not in (2, 3):
+            return
+        if self.isVisible() and not self.isMinimized():
+            self.minimize_to_tray()
+        else:
+            self.restore_from_tray()
+
+    def minimize_to_tray(self, notice: str = "") -> None:
+        """Свернуть окно в трей, не завершая лаунчер."""
+        if self.tray is None:
+            self.showMinimized()
+            return
+        self.hide()
+        if notice:
+            try:
+                self.tray.showMessage(APP_TITLE, notice)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def restore_from_tray(self) -> None:
+        """Развернуть окно лаунчера (из трея или при повторном запуске)."""
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def tray_quit(self) -> None:
+        """Настоящий выход из лаунчера (пункт «Выход» в меню значка)."""
+        self._tray_exit = True
+        self.close()
+
+    def _teardown(self) -> None:
+        """Остановить фоновые службы перед настоящим выходом."""
+        if self._ps_proc is not None:
+            try:
+                self._ps_proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        if self.tray is not None:
+            try:
+                self.tray.hide()
+            except Exception:  # noqa: BLE001
+                pass
+        srv = self._single_srv
+        if srv is not None:
+            try:
+                srv.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def attach_single_listener(self, srv) -> None:
+        """Слушать запросы «развернись» от вторых копий лаунчера."""
+        self._single_srv = srv
+        if srv is None:
+            return
+        self._single_timer = QTimer(self)
+        self._single_timer.setInterval(400)
+        self._single_timer.timeout.connect(self._poll_single)
+        self._single_timer.start()
+
+    def _poll_single(self) -> None:
+        """Забрать запрос второй копии и развернуть окно."""
+        srv = self._single_srv
+        if srv is None:
+            return
+        try:
+            conn, _addr = srv.accept()
+        except OSError:
+            return
+        if conn is None:
+            return
+        try:
+            conn.settimeout(0.3)
+            try:
+                conn.recv(64)
+            except OSError:
+                pass
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self.restore_from_tray()
+        self.log("Лаунчер развёрнут по повторному запуску")
 
     # ---------- состояние плеера: запущен/закрыт (v0.4.4) ----------
 
@@ -1848,8 +2071,21 @@ class LauncherWindow(QMainWindow):
             return  # кнопками управляет check_updates/refresh_state
         if running:
             self.log("Плеер запущен — кнопки запуска отключены")
+            # v0.4.5: пока плеер играет — окно лаунчера сворачивается в трей
+            self.minimize_to_tray(
+                "Плеер запущен — лаунчер свёрнут в трей.\n"
+                "Щёлкните значок в трее, чтобы вернуть окно; когда "
+                "закроете плеер, лаунчер развернётся сам.")
         else:
             self.log("Плеер закрыт — запуск снова доступен")
+            # v0.4.5: плеер закрыт — окно лаунчера разворачивается обратно
+            self.restore_from_tray()
+            if self.tray is not None:
+                try:
+                    self.tray.showMessage(
+                        APP_TITLE, "Плеер закрыт — лаунчер развёрнут.")
+                except Exception:  # noqa: BLE001
+                    pass
         self.refresh_state()
 
     # ---------- проверка обновлений ----------
@@ -2189,11 +2425,12 @@ class LauncherWindow(QMainWindow):
             self.dir_combo.setCurrentIndex(0)
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        if self._ps_proc is not None:
-            try:
-                self._ps_proc.kill()
-            except Exception:
-                pass
+        if self._tray_exit:
+            # настоящий выход: пункт «Выход» меню трея или выход во время
+            # скачивания/установки по подтверждению пользователя
+            self._teardown()
+            event.accept()
+            return
         if self._busy and (self._download_thread and self._download_thread.isRunning()
                            or self._install_thread and self._install_thread.isRunning()):
             btn = QMessageBox.question(
@@ -2203,6 +2440,26 @@ class LauncherWindow(QMainWindow):
             if btn != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+            self._tray_exit = True
+            self._teardown()
+            event.accept()
+            return
+        # v0.4.5: крестик сворачивает лаунчер в трей — плеер, проверки и
+        # обновления продолжают работать; настоящий выход — меню значка
+        if self.tray is not None:
+            event.ignore()
+            self.hide()
+            if not self._tray_notice_shown:
+                self._tray_notice_shown = True
+                try:
+                    self.tray.showMessage(
+                        APP_TITLE,
+                        "Лаунчер свёрнут в трей. Щёлкните значок, чтобы "
+                        "открыть окно; выход — в меню значка.")
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        self._teardown()
         event.accept()
 
 
@@ -2212,7 +2469,13 @@ def main():
     app.setApplicationName("Hox Launcher")
     app.setApplicationVersion(LAUNCHER_VERSION)
     app.setWindowIcon(QIcon(draw_logo(64)))
+    # v0.4.5: одиночный экземпляр — если лаунчер уже запущен (в т.ч.
+    # свёрнут в трей), повторный запуск разворачивает первое окно
+    srv = _single_bind()
+    if srv is None and _single_notify_existing():
+        return
     win = LauncherWindow()
+    win.attach_single_listener(srv)
     win.show()
     sys.exit(app.exec())
 
