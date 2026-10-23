@@ -15,10 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Qt 6.8
+      - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
-          version: '6.8.1'
+          version: '6.7.3'
           arch: win64_msvc2022_64
           cache: true
 
