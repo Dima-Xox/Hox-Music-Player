@@ -40,14 +40,6 @@ jobs:
         shell: pwsh
         run: cmake --build build --config Release --parallel
 
-      - name: Selfcheck (CI smoke)
-        shell: pwsh
-        run: |
-          & "build\bin\HoxPlayer.exe" --selfcheck
-          if ($LASTEXITCODE -ne 0) { throw "HoxPlayer selfcheck failed: $LASTEXITCODE" }
-          & "build\bin\HoxLauncher.exe" --selfcheck
-          if ($LASTEXITCODE -ne 0) { throw "HoxLauncher selfcheck failed: $LASTEXITCODE" }
-
       - name: Deploy Qt runtime (windeployqt)
         shell: pwsh
         run: |
@@ -57,6 +49,17 @@ jobs:
           & $wqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw --no-quick-import "build\bin\HoxLauncher.exe"
           if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
 
+      - name: Selfcheck (CI smoke)
+        shell: pwsh
+        run: |
+          Get-ChildItem build\bin | Out-Host
+          $tests = @('build\bin\HoxPlayer.exe', 'build\bin\HoxLauncher.exe')
+          foreach ($t in $tests) {
+            if (-not (Test-Path $t)) { throw "not found: $t" }
+            $p = Start-Process -FilePath (Resolve-Path $t) -ArgumentList '--selfcheck' -Wait -PassThru -NoNewWindow
+            Write-Host "$t exit code: $($p.ExitCode)"
+            if ($p.ExitCode -ne 0) { throw "$t selfcheck failed: $($p.ExitCode)" }
+          }
       - name: Assemble payload
         shell: pwsh
         run: |
