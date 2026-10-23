@@ -26,7 +26,7 @@ add_executable(HoxPlayer WIN32
     res/resources.qrc
 )
 target_link_libraries(HoxPlayer PRIVATE Qt6::Widgets Qt6::Multimedia Qt6::Network)
-target_include_directories(HoxPlayer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(HoxPlayer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
 
 if(WIN32)
     target_sources(HoxPlayer PRIVATE res/app.rc)
@@ -39,7 +39,7 @@ add_executable(HoxLauncher WIN32
     res/resources.qrc
 )
 target_link_libraries(HoxLauncher PRIVATE Qt6::Widgets Qt6::Network Qt6::Concurrent shell32)
-target_include_directories(HoxLauncher PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(HoxLauncher PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
 
 if(WIN32)
     target_sources(HoxLauncher PRIVATE res/app.rc)
