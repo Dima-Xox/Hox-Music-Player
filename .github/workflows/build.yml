@@ -77,6 +77,31 @@ jobs:
       - name: Install NSIS and build installer
         shell: pwsh
         run: |
+          # Готовим welcome-битмап (NSIS требует 24-битный BMP 164x314)
+          Add-Type -AssemblyName System.Drawing
+          New-Item -ItemType Directory -Force installer\assets | Out-Null
+          $w = 164; $h = 314
+          $bmp = New-Object System.Drawing.Bitmap($w, $h, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $rect = New-Object System.Drawing.Rectangle(0, 0, $w, $h)
+          $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect,
+                     [System.Drawing.Color]::FromArgb(11, 16, 32),
+                     [System.Drawing.Color]::FromArgb(20, 31, 58), 90)
+          $g.FillRectangle($brush, $rect)
+          $f1 = New-Object System.Drawing.Font('Segoe UI', 26, [System.Drawing.FontStyle]::Bold)
+          $b1 = [System.Drawing.Brushes]::White
+          $g.DrawString('Hox', $f1, $b1, 40, 96)
+          $f2 = New-Object System.Drawing.Font('Segoe UI', 7)
+          $b2 = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(143, 156, 184))
+          $g.DrawString('MUSIC PLAYER', $f2, $b2, 48, 168)
+          $accent = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(79, 195, 247))
+          $g.FillRectangle($accent, 52, 196, 60, 3)
+          $g.Dispose()
+          $bmp.Save((Resolve-Path 'installer\assets').Path + '\modern-wizard.bmp',
+                    [System.Drawing.Imaging.ImageFormat]::Bmp)
+          $bmp.Dispose()
+          Get-ChildItem installer\assets | Out-Host
+
           choco install nsis -y --no-progress
           $mk = Get-ChildItem "C:\Program Files*\NSIS\makensis.exe" -ErrorAction SilentlyContinue |
                 Select-Object -First 1 -ExpandProperty FullName
@@ -89,8 +114,8 @@ jobs:
             /DOUTFILE="$env:GITHUB_WORKSPACE\Hox-Setup-$ver.exe" /DESTSIZE=$kb `
             /DASSETS="$env:GITHUB_WORKSPACE\installer\assets" installer\hox-setup-cpp.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
-          $h = (Get-FileHash "Hox-Setup-$ver.exe" -Algorithm SHA256).Hash.ToLower()
-          "$h  Hox-Setup-$ver.exe" | Out-File -NoNewline "Hox-Setup-$ver.exe.sha256" -Encoding ascii
+          $h2 = (Get-FileHash "Hox-Setup-$ver.exe" -Algorithm SHA256).Hash.ToLower()
+          "$h2  Hox-Setup-$ver.exe" | Out-File -NoNewline "Hox-Setup-$ver.exe.sha256" -Encoding ascii
           Get-Content "Hox-Setup-$ver.exe.sha256"
 
       - name: Upload artifact
