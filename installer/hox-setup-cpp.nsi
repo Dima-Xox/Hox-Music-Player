@@ -44,7 +44,8 @@ ShowUninstDetails show
 
 !define MUI_ICON   "${PAYLOAD}/bin/hox.ico"
 !define MUI_UNICON "${PAYLOAD}/bin/hox.ico"
-!define MUI_WELCOMEFINISHPAGE_BITMAP "${ASSETS}/modern-wizard.bmp"
+; welcome-страница MUI — стандартная (кастомный битмап отключён: File-глоб
+; на Windows-сборке нестабильно матчит абсолютный путь)
 
 !define MUI_FINISHPAGE_RUN
 !define MUI_FINISHPAGE_RUN_FUNCTION "LaunchPlayer"
