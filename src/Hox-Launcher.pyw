@@ -53,7 +53,7 @@ import urllib.error
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, Tuple
 
-LAUNCHER_VERSION = "3.2"
+LAUNCHER_VERSION = "3.3"
 APP_TITLE = "Hox — Лаунчер"
 PLAYER_SCRIPT = "hox_music_player.py"
 # Манифест целостности: SHA-256 установленных файлов плеера; пишется при
@@ -105,6 +105,11 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # с GitHub показываются поверх этого списка)
 # ------------------------------------------------------------------
 NEWS: List[Tuple[str, List[str]]] = [
+    ("0.4.3", [
+        "Исправлена ошибка v0.4.2: установка не запускалась после успешного скачивания архива плеера — лаунчер оставался в режиме «занят» с неактивными кнопками, а журнал обрывался на «Скачано».",
+        "Теперь цепочка работает целиком: «Обновить / Переустановить» -> скачивание Hox-Player-*.zip -> проверка SHA-256 -> распаковка в app -> манифест целостности -> «Установка завершена».",
+        "Сам плеер без функциональных изменений: караоке, синхронизатор текста, темы и все возможности предыдущих версий полностью на месте.",
+    ]),
     ("0.4.2", [
         "Лаунчер сжался под маленькие экраны: окно автоматически подстраивается под разрешение (проверено на 1366x768) — панель установки, кнопка «Обновить» и прогресс-бар всегда видны целиком, ничего не уезжает за край экрана.",
         "На компактных экранах уменьшаются только гибкие блоки (новости, журнал, скриншоты); на обычных разрешениях окно выглядит как раньше.",
@@ -1838,7 +1843,23 @@ class LauncherWindow(QMainWindow):
         self._downloaded = Path(path)
         self.log("Скачано: {} ({:.1f} МБ)".format(
             path, self._downloaded.stat().st_size / 1048576.0))
-        self.run_install(self._downloaded, "скачанный пакет")
+        # FIX v0.4.3 (Лаунчер 3.3): две ошибки v0.4.2 на пути
+        # «скачал -> установил»:
+        # 1) busy оставался поднятым после скачивания, а run_install()
+        #    начинается с `if self._busy: return` — установка молча
+        #    пропускалась, лаунчер зависал с неактивными кнопками
+        #    (лог обрывался на «Скачано …»; доказано тестом
+        #    scripts/prove_busy_bug.py на коде v0.4.2);
+        # 2) kind_hint не передавался: пакет качается под именем
+        #    Hox-download-<ver>-Hox-Player-<ver>.zip, проверка
+        #    startswith("hox-player-") на нём ложна -> установка шла по
+        #    generic-пути zip (без манифеста целостности, а при цели в
+        #    собственную папку — «самообновление» через cmd, которое с
+        #    плоским zip плеера ничего не устанавливает). Скачивание в
+        #    лаунчере 3.x — это всегда архив плеера, поэтому передаём
+        #    kind_hint="player" явно.
+        self.set_busy(False)
+        self.run_install(self._downloaded, "скачанный пакет", "player")
 
     def on_download_failed(self, err: str) -> None:
         self.set_busy(False)
@@ -1881,7 +1902,7 @@ class LauncherWindow(QMainWindow):
             kind = "setup"
             self._install_thread = InstallWorker(kind, target, desktop, startmenu,
                                                  setup_path=path)
-        elif kind_hint == "player" or path.name.lower().startswith("hox-player-"):
+        elif kind_hint == "player" or "hox-player-" in path.name.lower():
             kind = "player"
             self._install_thread = InstallWorker(kind, target, desktop, startmenu,
                                                  zip_path=path)
