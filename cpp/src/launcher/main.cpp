@@ -10,6 +10,7 @@
 #include <QPushButton>
 #include <QProgressBar>
 #include <QPlainTextEdit>
+#include <QPainter>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QNetworkAccessManager>

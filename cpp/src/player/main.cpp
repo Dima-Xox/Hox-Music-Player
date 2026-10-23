@@ -5,6 +5,7 @@
 #include <QSplashScreen>
 #include <QPixmap>
 #include <QPainter>
+#include <QPainterPath>
 #include <QTimer>
 #include <QLocalServer>
 #include <QLocalSocket>
@@ -102,7 +103,7 @@ int main(int argc, char *argv[])
     QObject::connect(srv, &QLocalServer::newConnection, &app, [srv, win]() {
         while (QLocalSocket *c = srv->nextPendingConnection()) {
             QObject::connect(c, &QLocalSocket::disconnected, c, &QLocalSocket::deleteLater);
-            QObject::connect(c, &QLocalSocket::readyRead, &app, [c, win]() {
+            QObject::connect(c, &QLocalSocket::readyRead, c, [c, win]() {
                 const QStringList paths =
                     QString::fromUtf8(c->readAll()).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
                 if (win && !paths.isEmpty()) {

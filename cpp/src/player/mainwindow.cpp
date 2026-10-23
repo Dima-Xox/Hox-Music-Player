@@ -31,6 +31,7 @@
 #include <QRegularExpression>
 #include <QMediaMetaData>
 #include <QShortcut>
+#include <QApplication>
 #include <algorithm>
 
 // ---------------------------------------------------------------- темы
@@ -578,7 +579,7 @@ void MainWindow::probeStatus(QMediaPlayer::MediaStatus st)
         const QMediaMetaData md = m_probe->metaData();
         const QString mTitle = md.stringValue(QMediaMetaData::Title);
         const QString mArtist = md.stringValue(QMediaMetaData::Artist);
-        const QString mAlbum = md.stringValue(QMediaMetaData::Album);
+        const QString mAlbum = md.stringValue(QMediaMetaData::AlbumTitle);
         if (!mTitle.isEmpty())
             t.title = mTitle;
         if (!mArtist.isEmpty())
