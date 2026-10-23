@@ -29,6 +29,11 @@ Hox Launcher v3.5 — проверка целостности + установк
   * запасной TLS-режим: если проверка сертификата не проходит (старые
     корневые сертификаты Windows 7), скачивание повторяется без неё;
   * перед обновлением сам закрывает запущенный плеер;
+  * v0.4.6: лаунчер обновляет сам себя с GitHub Releases — если релиз
+    новее его сборки (RELEASE_VERSION), кнопка «Обновить лаунчер»
+    скачивает установщик Hox-Setup-<версия>.exe (проверка SHA-256),
+    запускает его тихо (/S) — установщик заменит файлы и перезапустит
+    лаунчер сам; после него обновляется и плеер;
   * пока плеер запущен, кнопки запуска неактивны (опрос player.lock, v0.4.4);
   * v0.4.5: пока плеер запущен, окно лаунчера сворачивается в трей,
     при закрытии плеера — разворачивается обратно; крестик оставляет
@@ -39,7 +44,7 @@ Hox Launcher v3.5 — проверка целостности + установк
 Совместимость: PyQt6 на Win8.1/10/11 и fake-PyQt6 (PyQt5) на Win7 SP1
 (Python 3.8) — синтаксис ограничен 3.8, только scoped-энумы.
 
-Версия: 3.5 (релиз плеера 0.4.5)
+Версия: 3.6 (релиз плеера 0.4.6)
 """
 
 import os
@@ -59,7 +64,13 @@ import urllib.error
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, Tuple
 
-LAUNCHER_VERSION = "3.5"
+LAUNCHER_VERSION = "3.6"
+# Релиз, которому соответствует эта сборка лаунчера (версии плеера и
+# лаунчера выпускаются вместе). Если в GitHub Releases появился релиз
+# новее, лаунчер предлагает обновить сам себя: скачивает установщик
+# Hox-Setup-<версия>.exe (для Win7-сборки — Hox-Setup-Win7-*.exe)
+# и запускает его тихо — тот заменяет файлы и перезапускает лаунчер.
+RELEASE_VERSION = "0.4.6"
 APP_TITLE = "Hox — Лаунчер"
 PLAYER_SCRIPT = "hox_music_player.py"
 # Манифест целостности: SHA-256 установленных файлов плеера; пишется при
@@ -97,6 +108,10 @@ PS_SWEEP_SEC = 15.0          # период фоновой проверки пр
 # (настоящий выход — пункт «Выход» в меню значка). Повторный запуск
 # лаунчера не создаёт вторую копию — разворачивает первое окно.
 SINGLE_PORTS = (46121, 46122, 46123)  # TCP на 127.0.0.1: «уже запущен»
+
+# v0.4.6 (лаунчер 3.6): файл лаунчера в payload — по нему установщик
+# подтверждает успешное самообновление лаунчера.
+LAUNCHER_FILE = "Hox-Launcher.pyw"
 # Однострочник: PID процессов плеера (в cmdline есть hox_music_player).
 # Get-CimInstance — Win8.1/10/11; на Win7 (PS 2.0, без CIM) — wmic.
 PS_PLAYER_PIDS_CMD = (
@@ -147,6 +162,11 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # с GitHub показываются поверх этого списка)
 # ------------------------------------------------------------------
 NEWS: List[Tuple[str, List[str]]] = [
+    ("0.4.6", [
+        "Лаунчер научился обновлять сам себя: если на GitHub вышел релиз новее, лаунчер сам предложит «Обновить лаунчер до v…» — скачает установщик, проверит его по SHA-256, запустит тихо и перезапустится; руками что-либо скачивать не нужно.",
+        "Обновление лаунчера предлагается раньше обновления плеера: свежий лаунчер гарантирует корректную установку новых версий плеера (старые копии лаунчера, например v0.4.2, сами не умели ставить плеер).",
+        "После самообновления лаунчера файлы и настройки плеера сохраняются: установщик заменяет только лаунчер и runtime, а плеер доустанавливается одной кнопкой, если он новее установленного.",
+    ]),
     ("0.4.5", [
         "Лаунчер сам уходит в трей, пока играет музыка: как только плеер запущен, окно сворачивается в значок в системном трее, а когда плеер закрыт — лаунчер сам разворачивается обратно.",
         "Крестик больше не выключает лаунчер: он продолжает работать в трее — запуск плеера, проверка обновлений и настоящий выход доступны из меню значка; при первом сворачивании показывается подсказка.",
@@ -615,11 +635,37 @@ def github_latest(repo: str) -> Optional[Dict[str, Any]]:
         if str(a.get("name", "")) == asset_name + ".sha256":
             sha_url = str(a.get("browser_download_url", ""))
             break
+
+    # v3.6: дополнительно выбираем установщик лаунчера — по нему лаунчер
+    # обновляет сам себя. Для основной сборки это Hox-Setup-<ver>.exe,
+    # для Win7-сборки — Hox-Setup-Win7-<ver>.exe (runtime другой).
+    setup_re = re.compile(r"^hox-setup-(?:win7-)?(\d+(?:\.\d+)*)\.exe$")
+    setup, setup_ver = None, (0,)
+    for a in assets:
+        n = str(a.get("name", ""))
+        m = setup_re.match(n.lower())
+        if not m:
+            continue
+        if ("win7-" in n.lower()) != bool(IS_WIN7_BUILD):
+            continue  # чужая сборка
+        ver = tuple(int(x) for x in m.group(1).split("."))
+        if ver > setup_ver:
+            setup, setup_ver = a, ver
+    setup_url = str(setup.get("browser_download_url", "")) if setup else ""
+    setup_name = str(setup.get("name", "")) if setup else ""
+    setup_sha_url = ""
+    if setup_name:
+        for a in assets:
+            if str(a.get("name", "")) == setup_name + ".sha256":
+                setup_sha_url = str(a.get("browser_download_url", ""))
+                break
     notes = str(data.get("body", "") or "")
     published = str(data.get("published_at", "") or "")
     return {"version": version, "notes": notes, "asset_url": asset_url,
             "asset_name": asset_name, "sha_url": sha_url, "published": published,
-            "html_url": str(data.get("html_url", "") or "")}
+            "html_url": str(data.get("html_url", "") or ""),
+            "setup_url": setup_url, "setup_name": setup_name,
+            "setup_sha_url": setup_sha_url}
 
 
 def fetch_sha256(url: str) -> str:
@@ -629,6 +675,20 @@ def fetch_sha256(url: str) -> str:
         text = r.read(4096).decode("utf-8", errors="ignore")
     m = re.search(r"\b([0-9a-fA-F]{64})\b", text)
     return m.group(1).lower() if m else ""
+
+
+def launcher_update_available(remote_version: str) -> bool:
+    """True, если в релизе появился лаунчер новее текущей сборки.
+
+    Сравнивается версия релиза с RELEASE_VERSION — версией, которой
+    соответствует эта сборка лаунчера (плеер и лаунчер выпускаются
+    вместе, поэтому версия релиза == версия сборки лаунчера).
+    """
+    try:
+        return bool(remote_version) and \
+            parse_version(remote_version) > parse_version(RELEASE_VERSION)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def resolve_update_source(settings) -> Dict[str, Any]:
@@ -648,16 +708,29 @@ def resolve_update_source(settings) -> Dict[str, Any]:
             if gh.get("sha_url"):
                 try:
                     sha = fetch_sha256(str(gh["sha_url"]))
-                except Exception:
+                except Exception:  # noqa: BLE001
                     sha = ""
+            # v3.6: SHA-256 установщика лаунчера + признак «есть обновление
+            # самого лаунчера» (релиз новее RELEASE_VERSION этой сборки)
+            setup_sha = ""
+            if gh.get("setup_sha_url"):
+                try:
+                    setup_sha = fetch_sha256(str(gh["setup_sha_url"]))
+                except Exception:  # noqa: BLE001
+                    setup_sha = ""
             result.update({"kind": "github", "version": gh["version"],
                            "notes": gh["notes"], "url": gh["asset_url"],
                            "asset_name": gh["asset_name"], "sha256": sha,
                            "published": gh.get("published", ""),
                            "html_url": gh.get("html_url", ""),
+                           "setup_url": str(gh.get("setup_url", "") or ""),
+                           "setup_name": str(gh.get("setup_name", "") or ""),
+                           "setup_sha256": setup_sha,
+                           "launcher_update": launcher_update_available(
+                               str(gh["version"])),
                            "source": "GitHub: " + repo})
             return result
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass  # падаем на манифест
     if murl:
         try:
@@ -672,6 +745,8 @@ def resolve_update_source(settings) -> Dict[str, Any]:
             result.update({"kind": "manifest", "version": str(data.get("version", "")),
                            "notes": str(data.get("notes", "") or ""), "url": url,
                            "sha256": str(data.get("sha256", "") or ""),
+                           "setup_url": "", "setup_name": "", "setup_sha256": "",
+                           "launcher_update": False,
                            "source": "манифест"})
             return result
         except Exception:
@@ -1017,7 +1092,9 @@ class InstallWorker(QThread):
     kind='selfcopy' — копирование собственной установки в новую папку
                       (перенос/восстановление без интернета);
     kind='setup'    — тихая установка Hox-Setup.exe (/S /D=) с опросом
-                      числа файлов для прогресса.
+                      числа файлов для прогресса (v3.6: также
+                      самообновление лаунчера — check_file задаёт,
+                      какой файл подтверждает успешную установку).
     """
     stage = pyqtSignal(str)
     progress = pyqtSignal(int)
@@ -1026,7 +1103,7 @@ class InstallWorker(QThread):
 
     def __init__(self, kind: str, target: Path, desktop: bool, startmenu: bool,
                  zip_path: Optional[Path] = None, setup_path: Optional[Path] = None,
-                 parent=None):
+                 parent=None, check_file: str = PLAYER_SCRIPT):
         super().__init__(parent)
         self.kind = kind
         self.target = target
@@ -1034,6 +1111,7 @@ class InstallWorker(QThread):
         self.startmenu = startmenu
         self.zip_path = zip_path
         self.setup_path = setup_path
+        self.check_file = check_file
         self._cancelled = False
 
     def log(self, msg: str) -> None:
@@ -1224,6 +1302,15 @@ class InstallWorker(QThread):
 
     # ---------- setup /S /D ----------
 
+    def _verify_setup_installed(self) -> None:
+        """Проверка результата тихой установки: check_file должен
+        появиться в <target>\app. Для обновления плеера это файл плеера,
+        для самообновления лаунчера (v3.6) — Hox-Launcher.pyw (плеер
+        мог быть ещё не установлен — это не ошибка обновления)."""
+        if not (self.target / "app" / self.check_file).is_file():
+            raise ValueError("установщик завершился, но файл не появился: "
+                             + self.check_file)
+
     def run_setup_exe(self, exe: Optional[Path] = None) -> None:
         exe = exe or self.setup_path
         if exe is None:
@@ -1241,8 +1328,7 @@ class InstallWorker(QThread):
             self.progress.emit(min(95, int(found * 100 / EST_FILES)))
             time.sleep(1.0)
         self.progress.emit(100)
-        if not (self.target / "app" / PLAYER_SCRIPT).is_file():
-            raise ValueError("установщик завершился, но файлы плеера не появились")
+        self._verify_setup_installed()
         # NSIS создал все ярлыки сам — применяем выбор пользователя
         if os.name == "nt":
             ps_del = []
@@ -1525,6 +1611,9 @@ class LauncherWindow(QMainWindow):
         self._integrity_ok = True
         self._install_after_check = False
         self._pending: Optional[Dict[str, Any]] = None
+        # v3.6: что ждёт в _pending — "" (архив плеера) или "launcher"
+        # (установщик для самообновления лаунчера)
+        self._pending_kind = ""
         self._downloaded: Optional[Path] = None
         self._check_thread: Optional[QThread] = None
         self._download_thread: Optional[QThread] = None
@@ -1814,7 +1903,10 @@ class LauncherWindow(QMainWindow):
         # v0.4.5: синхронизировать «Запустить плеер» в меню значка трея
         if self._tray_act_launch is not None:
             self._tray_act_launch.setEnabled(act)
-        if self._pending is not None:
+        if self._pending is not None and self._pending_kind == "launcher":
+            self.btn_install.setText("⬆  Обновить лаунчер до v{}".format(
+                self._pending.get("version", "")))
+        elif self._pending is not None:
             self.btn_install.setText("⬇  Обновить до v{}".format(
                 self._pending.get("version", "")))
         elif not self._installed:
@@ -2151,6 +2243,7 @@ class LauncherWindow(QMainWindow):
         self._install_after_check = False
         if src.get("kind") == "none":
             self._pending = None
+            self._pending_kind = ""
             self.update_label.setText(
                 "Источник обновлений не настроен — лаунчер работает автономно. "
                 "Укажите GitHub-репозиторий (launcher.ini → [updates] github_repo) "
@@ -2174,8 +2267,27 @@ class LauncherWindow(QMainWindow):
         self.log("Источник: {} — v{}".format(src.get("source"), remote))
         try:
             has_update = parse_version(remote) > parse_version(local)
-        except Exception:
+        except Exception:  # noqa: BLE001
             has_update = False
+        # v3.6: обновление САМОГО лаунчера — приоритет над обновлением плеера:
+        # свежий лаунчер гарантирует корректную установку новых версий плеера
+        if bool(src.get("launcher_update")):
+            self._pending = dict(src)
+            self._pending_kind = "launcher"
+            self._downloaded = None
+            self.update_label.setText(
+                "ДОСТУПНО ОБНОВЛЕНИЕ ЛАУНЧЕРА: v{} (у вас v{}) — нажмите "
+                "«Обновить лаунчер до v{}»: скачается установщик, проверится по "
+                "SHA-256 и запустится тихо — лаунчер перезапустится сам, после "
+                "чего обновится и плеер.".format(remote, RELEASE_VERSION, remote))
+            self.update_label.setStyleSheet(
+                "color: {}; font-weight: bold;".format(WARN))
+            self.news_box.setHtml(news_html(extra_head=release_notes_html(src)))
+            self.log("Доступно обновление лаунчера: v{} -> v{}".format(
+                RELEASE_VERSION, remote))
+            self.refresh_state()
+            return
+        self._pending_kind = ""
         if click_install:
             # пользователь нажал «Обновить / Переустановить» — качаем и ставим
             self._pending = dict(src)
@@ -2213,9 +2325,11 @@ class LauncherWindow(QMainWindow):
             self.refresh_state()
             return
         self._pending = None
+        self._pending_kind = ""
         self.update_label.setText(
-            "У вас последняя версия: v{} (источник: {}). Файлы проверены — целы.".
-            format(local, src.get("source", "")))
+            "У вас последняя версия: лаунчер v{} (релиз v{}), плеер v{} — "
+            "источник: {}. Файлы проверены — целы.".format(
+                LAUNCHER_VERSION, RELEASE_VERSION, local, src.get("source", "")))
         self.update_label.setStyleSheet("color: {};".format(OK))
         self.refresh_state()
 
@@ -2260,21 +2374,41 @@ class LauncherWindow(QMainWindow):
         if self._pending is None or self._busy:
             return
         src = self._pending
-        url = str(src.get("url", "") or "")
-        if not url:
-            QMessageBox.warning(self, "Hox", "В источнике обновления нет ссылки на пакет.")
-            return
-        ver = str(src.get("version", "new"))
-        last = url.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
-        if not last.lower().endswith((".zip", ".exe")):
-            last = "Hox-Player-" + ver + ".zip"
+        if self._pending_kind == "launcher":
+            # v3.6: качаем установщик лаунчера Hox-Setup-<ver>.exe
+            # (Win7-сборка — Hox-Setup-Win7-<ver>.exe), а не архив плеера
+            url = str(src.get("setup_url", "") or "")
+            if not url:
+                QMessageBox.warning(
+                    self, "Hox",
+                    "В релизе нет установщика лаунчера Hox-Setup-*.exe — "
+                    "обновите лаунчер вручную, скачав установщик с GitHub.")
+                return
+            ver = str(src.get("version", "new"))
+            last = str(src.get("setup_name", "") or "") or \
+                "Hox-Setup-" + ver + ".exe"
+            sha = str(src.get("setup_sha256", "") or "")
+        else:
+            url = str(src.get("url", "") or "")
+            if not url:
+                QMessageBox.warning(self, "Hox",
+                                    "В источнике обновления нет ссылки на пакет.")
+                return
+            ver = str(src.get("version", "new"))
+            last = url.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+            if not last.lower().endswith((".zip", ".exe")):
+                last = "Hox-Player-" + ver + ".zip"
+            sha = str(src.get("sha256", "") or "")
         dest = Path(tempfile.gettempdir()) / ("Hox-download-" + ver + "-" + last)
         self.set_busy(True)
         self.progress.setValue(0)
-        self.status_label.setText("Скачиваю обновление v{}…".format(ver))
-        self.log("Скачивание: " + url)
-        self._download_thread = DownloadWorker(url, dest,
-                                               str(src.get("sha256", "") or ""))
+        if self._pending_kind == "launcher":
+            self.status_label.setText("Скачиваю обновление лаунчера v{}…".format(ver))
+            self.log("Скачивание установщика лаунчера: " + url)
+        else:
+            self.status_label.setText("Скачиваю обновление v{}…".format(ver))
+            self.log("Скачивание: " + url)
+        self._download_thread = DownloadWorker(url, dest, sha)
         self._download_thread.progress.connect(self.progress.setValue)
         self._download_thread.stage.connect(self.status_label.setText)
         self._download_thread.done_ok.connect(self.on_download_done)
@@ -2297,10 +2431,17 @@ class LauncherWindow(QMainWindow):
         #    startswith("hox-player-") на нём ложна -> установка шла по
         #    generic-пути zip (без манифеста целостности, а при цели в
         #    собственную папку — «самообновление» через cmd, которое с
-        #    плоским zip плеера ничего не устанавливает). Скачивание в
-        #    лаунчере 3.x — это всегда архив плеера, поэтому передаём
-        #    kind_hint="player" явно.
+        #    плоским zip плеера ничего не устанавливает). Скачивание архива
+        #    плеера передаёт kind_hint="player" явно; v3.6: путь
+        #    самообновления лаунчера передаёт kind_hint="launcher".
         self.set_busy(False)
+        if self._pending_kind == "launcher":
+            # v3.6: скачан установщик лаунчера — тихая установка /S /D=;
+            # установщик закроет этот экземпляр лаунчера, заменит файлы
+            # и сам перезапустит уже новый лаунчер
+            self.run_install(self._downloaded, "скачанный установщик лаунчера",
+                             "launcher")
+            return
         self.run_install(self._downloaded, "скачанный пакет", "player")
 
     def on_download_failed(self, err: str) -> None:
@@ -2346,8 +2487,13 @@ class LauncherWindow(QMainWindow):
             self._install_thread = InstallWorker(kind, target, desktop, startmenu)
         elif path.suffix.lower() == ".exe":
             kind = "setup"
+            # v3.6: путь самообновления лаунчера — проверяем файл лаунчера,
+            # а не плеера (плеер мог быть ещё не установлен)
+            check_file = LAUNCHER_FILE if kind_hint == "launcher" \
+                else PLAYER_SCRIPT
             self._install_thread = InstallWorker(kind, target, desktop, startmenu,
-                                                 setup_path=path)
+                                                 setup_path=path,
+                                                 check_file=check_file)
         elif kind_hint == "player" or "hox-player-" in path.name.lower():
             kind = "player"
             self._install_thread = InstallWorker(kind, target, desktop, startmenu,
