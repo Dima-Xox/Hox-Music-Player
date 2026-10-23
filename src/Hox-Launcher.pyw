@@ -53,7 +53,7 @@ import urllib.error
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, Tuple
 
-LAUNCHER_VERSION = "3.1"
+LAUNCHER_VERSION = "3.2"
 APP_TITLE = "Hox — Лаунчер"
 PLAYER_SCRIPT = "hox_music_player.py"
 # Манифест целостности: SHA-256 установленных файлов плеера; пишется при
@@ -105,6 +105,12 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # с GitHub показываются поверх этого списка)
 # ------------------------------------------------------------------
 NEWS: List[Tuple[str, List[str]]] = [
+    ("0.4.2", [
+        "Лаунчер сжался под маленькие экраны: окно автоматически подстраивается под разрешение (проверено на 1366x768) — панель установки, кнопка «Обновить» и прогресс-бар всегда видны целиком, ничего не уезжает за край экрана.",
+        "На компактных экранах уменьшаются только гибкие блоки (новости, журнал, скриншоты); на обычных разрешениях окно выглядит как раньше.",
+        "На совсем маленьких экранах включается внешняя прокрутка — интерфейс остаётся доступным на любом разрешении.",
+        "Сам плеер без функциональных изменений: караоке, синхронизатор текста, темы и все возможности предыдущих версий полностью на месте.",
+    ]),
     ("0.4.1", [
         "Лаунчер больше не скачивает плеер сам при запуске: при первом старте он проверяет наличие и целостность файлов и пишет «Требуется обновление» — скачивание и установка начинаются строго по нажатию кнопки «Обновить / Переустановить».",
         "Проверка целостности при каждом запуске: SHA-256 каждого файла плеера сверяется с манифестом установки (player_files.json); отсутствующие или повреждённые файлы — снова «Требуется обновление», установка чинит их в один клик.",
@@ -721,7 +727,8 @@ from PyQt6.QtWidgets import (
     QPushButton, QProgressBar, QMessageBox, QFileDialog, QComboBox,
     QCheckBox, QGroupBox, QScrollArea, QTextEdit, QFrame, QDialog
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
+from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QTimer, QSettings,
+                          QRect)
 from PyQt6.QtGui import QPixmap, QPainter, QColor, QLinearGradient, QPen, QFont, QIcon
 
 
@@ -1202,6 +1209,8 @@ LAUNCHER_QSS = """
                         font-size: 11px; color: {muted}; }}
     QScrollArea#ShotsArea {{ border: none; background: transparent; }}
     QWidget#ShotsRow {{ background: transparent; }}
+    QScrollArea#OuterScroll {{ border: none; background: transparent; }}
+    QScrollArea#OuterScroll > QWidget > QWidget {{ background: transparent; }}
     QScrollBar:vertical {{ background: transparent; width: 8px; margin: 0; }}
     QScrollBar::handle:vertical {{ background: #2a3252; border-radius: 4px;
                                    min-height: 24px; }}
@@ -1291,12 +1300,59 @@ class ShotPreview(QDialog):
         lay.addWidget(cap)
 
 
+# ------------------------------------------------------------------
+# Адаптивный размер окна: на маленьких экранах (1366x768 и ниже) окно
+# должно влезать в экран ЦЕЛИКОМ, включая панель установки с кнопкой
+# «Обновить» и прогресс-баром. Порядок сжатия: отступы -> новости ->
+# журнал -> скриншоты; если не хватило и этого — вызывающий код
+# включает внешнюю прокрутку (запасной режим).
+# ------------------------------------------------------------------
+WIN_W, WIN_H = 880, 816                     # исходный размер окна
+NEWS_H, SHOTS_H, LOG_H = 148, 130, 76       # исходные высоты гибких блоков
+NEWS_MIN, SHOTS_MIN, LOG_MIN = 72, 92, 48   # нижняя граница сжатия
+FRAME_MARGIN = 36   # запас на заголовок окна + границы (вне client area)
+COMPACT_SAVE = 51   # экономия компакт-режима: маргины 62->38 (24) + интервалы 9x8->9x5 (27)
+
+
+def fit_window_size(avail_w: int, avail_h: int) -> Tuple[int, int, int, int, int, int]:
+    """Размер окна и высоты гибких блоков, чтобы окно влезло в экран.
+
+    Возвращает (w, h, news_h, shots_h, log_h, overflow); overflow > 0
+    означает, что даже после сжатия контент выше экрана — нужна внешняя
+    прокрутка (запасной режим для очень маленьких экранов).
+    """
+    w = min(WIN_W, max(640, avail_w - 24))
+    h = min(WIN_H, max(480, avail_h - FRAME_MARGIN))
+    news_h, shots_h, log_h = NEWS_H, SHOTS_H, LOG_H
+    overflow = max(0, WIN_H - h)
+    if overflow > 0:
+        overflow -= COMPACT_SAVE  # плотнее отступы/интервалы в компакт-режиме
+        take = min(max(0, news_h - NEWS_MIN), max(0, overflow))
+        news_h -= take
+        overflow -= take
+        take = min(max(0, log_h - LOG_MIN), max(0, overflow))
+        log_h -= take
+        overflow -= take
+        take = min(max(0, shots_h - SHOTS_MIN), max(0, overflow))
+        shots_h -= take
+        overflow -= take
+        overflow = max(0, overflow)
+    return w, h, news_h, shots_h, log_h, overflow
+
+
 class LauncherWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(QIcon(draw_logo(64)))
-        self.setFixedSize(880, 816)
+        # Окно обязано влезать в экран целиком (1366x768 и меньше):
+        # подбираем размер и высоты гибких блоков под доступную геометрию.
+        scr = QApplication.primaryScreen()
+        geo = scr.availableGeometry() if scr else QRect(0, 0, 1366, 768)
+        win_w, win_h, self._news_h, self._shots_h, self._log_h, \
+            self._scroll_overflow = fit_window_size(geo.width(), geo.height())
+        self._compact = win_h < WIN_H
+        self.setFixedSize(win_w, win_h)
         self.setStyleSheet(LAUNCHER_QSS)
 
         self.settings = QSettings(str(app_base() / "launcher.ini"),
@@ -1312,10 +1368,24 @@ class LauncherWindow(QMainWindow):
         self._install_thread: Optional[QThread] = None
 
         central = QWidget()
-        self.setCentralWidget(central)
+        if self._scroll_overflow > 0:
+            # Экран настолько мал, что даже сжатый макет не влезает —
+            # запасной режим: вся компоновка во внешней прокрутке.
+            outer = QScrollArea()
+            outer.setObjectName("OuterScroll")
+            outer.setWidgetResizable(True)
+            outer.setFrameShape(QFrame.Shape.NoFrame)
+            outer.setWidget(central)
+            self.setCentralWidget(outer)
+        else:
+            self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(18, 14, 18, 12)
-        root.setSpacing(8)
+        if self._compact:
+            root.setContentsMargins(12, 8, 12, 6)
+            root.setSpacing(5)
+        else:
+            root.setContentsMargins(18, 14, 18, 12)
+            root.setSpacing(8)
 
         # --- шапка ---
         head = QHBoxLayout()
@@ -1359,7 +1429,7 @@ class LauncherWindow(QMainWindow):
         self.news_box.setObjectName("NewsBox")
         self.news_box.setReadOnly(True)
         self.news_box.setHtml(news_html())
-        self.news_box.setFixedHeight(148)
+        self.news_box.setFixedHeight(self._news_h)
         root.addWidget(self.news_box)
 
         # --- скриншоты ---
@@ -1369,8 +1439,9 @@ class LauncherWindow(QMainWindow):
         self.shots_area = QScrollArea()
         self.shots_area.setObjectName("ShotsArea")
         self.shots_area.setWidgetResizable(True)
-        self.shots_area.setFixedHeight(130)
-        self.shots_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.shots_area.setFixedHeight(self._shots_h)
+        # горизонтальная полоса — по необходимости (узкие экраны)
+        self.shots_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.shots_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         shots_row = QWidget()
         shots_row.setObjectName("ShotsRow")
@@ -1441,7 +1512,7 @@ class LauncherWindow(QMainWindow):
         self.log_box = QTextEdit()
         self.log_box.setObjectName("LogBox")
         self.log_box.setReadOnly(True)
-        self.log_box.setFixedHeight(76)
+        self.log_box.setFixedHeight(self._log_h)
         root.addWidget(self.log_box)
 
         self._fill_dir_combo()
@@ -1467,12 +1538,13 @@ class LauncherWindow(QMainWindow):
             v.setSpacing(4)
             btn = QPushButton()
             btn.setObjectName("ShotButton")
-            thumb = pm.scaled(200, 100,
+            btn_h = max(64, self._shots_h - 24)
+            thumb = pm.scaled(200, max(40, btn_h - 8),
                               Qt.AspectRatioMode.KeepAspectRatio,
                               Qt.TransformationMode.SmoothTransformation)
             btn.setIcon(QIcon(thumb))
             btn.setIconSize(thumb.size())
-            btn.setFixedSize(204, 106)
+            btn.setFixedSize(204, btn_h)
             btn.setToolTip(caption)
             btn.clicked.connect(lambda checked=False, p_=pm, c_=caption:
                                 self._show_shot(p_, c_))
