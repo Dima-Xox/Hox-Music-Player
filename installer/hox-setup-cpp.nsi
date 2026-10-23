@@ -42,8 +42,8 @@ SetCompressor /SOLID lzma
 ShowInstDetails show
 ShowUninstDetails show
 
-!define MUI_ICON   "${PAYLOAD}/bin/hox.ico"
-!define MUI_UNICON "${PAYLOAD}/bin/hox.ico"
+!define MUI_ICON   "${PAYLOAD}\bin\hox.ico"
+!define MUI_UNICON "${PAYLOAD}\bin\hox.ico"
 ; welcome-страница MUI — стандартная (кастомный битмап отключён: File-глоб
 ; на Windows-сборке нестабильно матчит абсолютный путь)
 
@@ -126,8 +126,8 @@ Section "Hox Music Player" SEC_MAIN
   SetOutPath "$INSTDIR"
 
   ; ---- файлы приложения
-  File /r "${PAYLOAD}/bin"
-  File /r "${PAYLOAD}/redist"
+  File /r "${PAYLOAD}\bin"
+  File /r "${PAYLOAD}\redist"
 
   ; ---- VC++ Redistributable (актуальные 2015-2022, x64 и x86, один UAC)
   !insertmacro EnsureVCRedists
