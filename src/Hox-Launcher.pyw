@@ -1,0 +1,1750 @@
+# -*- coding: utf-8 -*-
+"""
+Hox Launcher v3.0 — менеджер плеера: сам ставит и обновляет плеер.
+
+Схема «лаунчер отдельно — плеер отдельно» (v0.4.0):
+  * установщик Hox-Setup-*.exe ставит ТОЛЬКО лаунчер (runtime Python +
+    Hox-Launcher.pyw) и ярлык «Hox» на этот лаунчер;
+  * плеер (hox_music_player.py) лаунчер скачивает сам с GitHub Releases
+    отдельным архивом Hox-Player-<версия>.zip и распаковывает в папку app;
+  * при каждом запуске лаунчер проверяет релиз: если плеера нет — ставит
+    его автоматически; если установленная версия старее — предлагает
+    обновление в один клик;
+  * источники архива плеера (по приоритету):
+      1) GitHub Releases (репозиторий: константа GITHUB_REPO ниже или
+         [updates] github_repo в launcher.ini);
+      2) старый JSON-манифест ([updates] manifest_url в launcher.ini);
+      3) Hox-Player-*.zip рядом с лаунчером (автономная установка);
+      4) полный установщик Hox-Setup.exe рядом с лаунчером;
+      5) zip-пейлоад рядом с лаунчером / собственная копия файлов;
+  * проверка обновлений при запуске; на время проверки кнопка запуска
+    плеера заблокирована (как и просили);
+  * новости о новых версиях + галерея скриншотов прямо в окне;
+  * подпись «Ранняя бета»;
+  * перед обновлением сам закрывает запущенный плеер;
+  * никаких консольных окон (CREATE_NO_WINDOW, pythonw.exe).
+
+Совместимость: PyQt6 на Win8.1/10/11 и fake-PyQt6 (PyQt5) на Win7 SP1
+(Python 3.8) — синтаксис ограничен 3.8, только scoped-энумы.
+
+Версия: 3.0 (релиз плеера 0.4.0)
+"""
+
+import os
+import re
+import sys
+import json
+import time
+import hashlib
+import zipfile
+import shutil
+import tempfile
+import subprocess
+import urllib.request
+import urllib.error
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Callable, Tuple
+
+LAUNCHER_VERSION = "3.0"
+APP_TITLE = "Hox — Лаунчер"
+PLAYER_SCRIPT = "hox_music_player.py"
+# Win7-сборка (payload-win7) патчит эти две константы: маркер включается,
+# а локальная установка ищет Hox-Setup-Win7.exe рядом с лаунчером.
+IS_WIN7_BUILD = False
+SETUP_EXE = "Hox-Setup.exe"
+
+# GitHub-репозиторий релизов по умолчанию ("владелец/репозиторий").
+# Пусто = источник не задан; тогда лаунчер работает автономно, а
+# репозиторий можно указать в %LOCALAPPDATA%\Hoxmusicp\launcher.ini:
+#   [updates]
+#   github_repo = owner/hox-music-player
+GITHUB_REPO = "Dima-Xox/Hox-Music-Player"
+# Плеер запускается пропатченным Hox.exe (копия pythonw.exe с логотипом);
+# pythonw.exe оставлен как запасной вариант запуска
+PLAYER_EXE_NAMES = ("Hox.exe", "pythonw.exe")
+
+# Ключ деинсталляции — общий с Hox-Setup.nsi (INSTKEY)
+UNINST_KEY = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Hoxmusicp"
+REG_HOME = "Software\\Hoxmusicp"
+
+# Оценка числа файлов в пейлоаде — для грубого прогресса тихой установки
+EST_FILES = 1600
+
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HoxLauncher/" + LAUNCHER_VERSION
+
+# ------------------------------------------------------------------
+# Тема (в духе aurora плеера; лаунчер самодостаточен, свои QSS-переменные)
+# ------------------------------------------------------------------
+BG = "#10131f"
+BG2 = "#1a1f35"
+BG3 = "#232a4d"
+ACCENT = "#00e5ff"
+ACCENT2 = "#3d5afe"
+TEXT = "#e8ecf5"
+MUTED = "#8a93b2"
+BORDER = "#39405e"
+OK = "#4ec9b0"
+WARN = "#ffb454"
+
+CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+# ------------------------------------------------------------------
+# Встроенные новости о версиях (офлайн-фолбэк; онлайн-заметки релиза
+# с GitHub показываются поверх этого списка)
+# ------------------------------------------------------------------
+NEWS: List[Tuple[str, List[str]]] = [
+    ("0.4.0", [
+        "Новая схема «лаунчер отдельно — плеер отдельно»: установщик ставит только лаунчер, а плеер лаунчер скачивает с GitHub сам — отдельным лёгким архивом Hox-Player-<версия>.zip.",
+        "Если плеер ещё не установлен, лаунчер при запуске автоматически скачает и установит его, после чего плеер запускается одной кнопкой.",
+        "Обновления плеера: проверка при каждом запуске и по кнопке «Проверить обновления»; качается только архив плеера (сотни килобайт вместо полного установщика), каждый файл проверяется по SHA-256 до распаковки.",
+    ]),
+    ("0.3.9", [
+        "Репозиторий обновлений вшит в лаунчер: автообновление работает сразу после установки — launcher.ini настраивать не нужно.",
+        "Официальный источник обновлений: Dima-Xox/Hox-Music-Player (GitHub Releases); версия, заметки о релизе и установщики берутся оттуда.",
+        "Свой источник по-прежнему можно задать в launcher.ini ([updates] github_repo) — он перекрывает вшитый адрес.",
+    ]),
+    ("0.3.8", [
+        "Лаунчер обновлён до версии 2.0: установка плеера происходит прямо в окне лаунчера — с прогресс-баром, выбором папки и созданием ярлыков на рабочем столе и в меню «Пуск».",
+        "Проверка обновлений выполняется при запуске лаунчера (на время проверки кнопка запуска плеера заблокирована) и по кнопке «Проверить обновления» в любой момент.",
+        "Обновления берутся с GitHub Releases — всегда актуальная версия (репозиторий указывается в launcher.ini, см. README); скачивание идёт с прогресс-баром и проверкой SHA-256.",
+        "В лаунчер встроены новости о новых версиях и галерея скриншотов; рядом с прогресс-баром появилась кнопка «Открыть плеер».",
+        "Лаунчер работает автономно: без интернета он установит плеер из установщика Hox-Setup.exe, лежащего рядом, или из собственной копии файлов.",
+        "При обновлении поверх существующей установки настройки, темы и плейлисты полностью сохраняются; кнопка «Переустановить / восстановить» чинит установленного плеера в один клик.",
+        "Каждый файл проверяется по контрольной сумме SHA-256 до распаковки — повреждённая или неполная сборка просто не установится.",
+        "Деинсталлятор в «Приложения и компоненты» Windows аккуратно убирает плеер, лаунчер и ярлыки; автономный установщик Hox-Setup.exe по-прежнему поставляется отдельно — на случай полного отсутствия интернета.",
+    ]),
+    ("0.3.7", [
+        "Новый раздел «Инструменты → Синхронизатор текста»: отдельное окно создаёт синхронизированный текст песни — по готовому тексту или автопознаванием речи (Whisper) с пословными метками времени.",
+        "Запись в теги: MP3/WAV — SYLT + TXXX:LYRICS_LRC, FLAC — LYRICS/LYRICS_LINE; плеер читает эти теги, поэтому обработанный трек сразу играет с караоке-подсветкой.",
+        "Обработка идёт в фоне и не блокирует плеер; лог, drag&drop и автоподстановка текущего трека.",
+    ]),
+    ("0.3.6", [
+        "Вкладка «Текст песни» убрана — весь текст живёт в караоке-блоке на панели управления, рядом с обложкой и кнопками.",
+        "Активная строка подсвечивается сразу и заливается пословно; строки плавно скользят при смене куплета; клик — перемотка, колесо — прокрутка с автовозвратом.",
+        "Правый клик по караоке: загрузить .lrc/.txt, сдвиг синхронизации ±0.5 с, сброс.",
+    ]),
+    ("0.3.5", [
+        "Текст песни в стиле стриминговых сервисов: крупные строки, активная — цветом темы, плавная автопрокрутка и пословная заливка.",
+        "Таймер песни: время, ползунок и длительность обновляются ровным ходом таймера 100 мс.",
+        "Честный режим для текста без таймингов — без ложной подсветки.",
+    ]),
+    ("0.3.4", [
+        "Визуализатор-эквалайзер стал крупнее и толще; тотальная векторизация иконок (18 рисунков в цвете темы).",
+        "Умный караоке-таймер по тишине: «Играет проигрыш — вокал через N с»; сдвиг синхронизации ±0.5 с.",
+        "Анимированный сплэш-экран и оптимизация процессора.",
+    ]),
+]
+
+# Скриншоты для галереи (ищутся в launcher_shots/ рядом с лаунчером
+# или внутри установленного плеера). Имена без версии — не меняются
+# от релиза к релизу.
+SHOTS: List[Tuple[str, str]] = [
+    ("shot-main-aurora.png", "Главное окно — тема Aurora"),
+    ("shot-sync-aurora.png", "Синхронизатор текста"),
+    ("shot-mini.png", "Мини-плеер"),
+    ("shot-splash.png", "Сплэш-экран"),
+]
+
+
+# ------------------------------------------------------------------
+# Процессы плеера (закрытие перед обновлением) — из v1.7, проверено
+# ------------------------------------------------------------------
+def _player_pids() -> list:
+    """PID всех python/Hox-процессов, запущенных из каталога установки Hox.
+
+    Ищем через PowerShell CIM по командной строке — надёжно работает даже
+    на свежих Windows 11, где wmic удалён.
+    """
+    if os.name != "nt":
+        return []
+    try:
+        ps_cmd = ("Get-CimInstance Win32_Process | Where-Object { $_.Name -imatch '^(python|hox)' "
+                  "-and $_.CommandLine -match 'Hoxmusicp|\\\\Hox\\\\' } | "
+                  "ForEach-Object { $_.ProcessId }")
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=30,
+            creationflags=CREATE_NO_WINDOW, check=False)
+        return [int(x) for x in r.stdout.split() if x.strip().isdigit()]
+    except Exception:
+        return []
+
+
+def _pids_alive(pids: list) -> list:
+    """Какие из PID ещё живы (через OpenProcess, без сторонних утилит)."""
+    if os.name != "nt" or not pids:
+        return []
+    try:
+        import ctypes
+        alive = []
+        for pid in pids:
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
+            if handle:  # PROCESS_QUERY_LIMITED_INFORMATION
+                ctypes.windll.kernel32.CloseHandle(handle)
+                alive.append(pid)
+        return alive
+    except Exception:
+        return list(pids)  # не смогли проверить — считаем живыми
+
+
+def close_player_processes(timeout: float = 12.0) -> bool:
+    """Завершить плеер перед обновлением файлов (мягко, затем принудительно)."""
+    if os.name != "nt":
+        return True
+    try:
+        pids = [p for p in _player_pids() if p != os.getpid()]
+        if not pids:
+            return True
+        args = ["taskkill"]
+        for pid in pids:
+            args += ["/PID", str(pid)]
+        subprocess.run(args, capture_output=True, timeout=15,
+                       creationflags=CREATE_NO_WINDOW, check=False)
+        deadline = time.monotonic() + timeout / 2
+        while time.monotonic() < deadline:
+            if not _pids_alive(pids):
+                return True
+            time.sleep(0.3)
+        subprocess.run(args + ["/F"], capture_output=True, timeout=15,
+                       creationflags=CREATE_NO_WINDOW, check=False)
+        deadline = time.monotonic() + timeout / 2
+        while time.monotonic() < deadline:
+            if not _pids_alive(pids):
+                return True
+            time.sleep(0.3)
+        return not _pids_alive(pids)
+    except Exception:
+        return False
+
+
+# ------------------------------------------------------------------
+# Пути и версии
+# ------------------------------------------------------------------
+def local_appdata() -> Path:
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    else:
+        local = str(Path.home() / ".local" / "share")
+    return Path(local)
+
+
+def app_base() -> Path:
+    """Каталог установки по умолчанию: %LOCALAPPDATA%\\Hoxmusicp."""
+    base = local_appdata() / "Hoxmusicp"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def own_base() -> Path:
+    """Каталог, где живёт сам лаунчер: <база>\\app\\Hox-Launcher.pyw.
+    Плеер по умолчанию ставится в эту же папку (туда же, где runtime)."""
+    return Path(__file__).resolve().parent.parent
+
+
+def runtime_bases() -> List[Path]:
+    """Каталоги-кандидаты, где может лежать runtime (Python) установки."""
+    out: List[Path] = []
+    try:
+        out.append(own_base())
+    except Exception:
+        pass
+    local = local_appdata()
+    out.append(local / "Hoxmusicp")
+    out.append(local / "Hox")  # старая установка
+    uniq: List[Path] = []
+    for c in out:
+        if c not in uniq:
+            uniq.append(c)
+    return uniq
+
+
+def find_install_base() -> Optional[Path]:
+    """Каталог, где реально установлен ПЛЕЕР (есть app/hox_music_player.py).
+    Лаунчер при этом может быть уже установлен, а плеер — ещё нет."""
+    for c in runtime_bases():
+        try:
+            if (c / "app" / PLAYER_SCRIPT).is_file() and \
+               ((c / "runtime" / "python").is_dir() or (c / "runtime").is_dir()):
+                return c
+        except Exception:
+            continue
+    return None
+
+
+def find_runtime() -> Optional[Path]:
+    """Hox.exe/pythonw.exe — независимо от того, скачан ли уже плеер."""
+    for base in runtime_bases():
+        for exe in PLAYER_EXE_NAMES:
+            p = base / "runtime" / "python" / exe
+            if p.is_file():
+                return p
+    return None
+
+
+def find_player_script() -> Optional[Path]:
+    base = find_install_base()
+    if base:
+        p = base / "app" / PLAYER_SCRIPT
+        if p.is_file():
+            return p
+    here = Path(__file__).resolve().parent
+    p = here / PLAYER_SCRIPT
+    return p if p.is_file() else None
+
+
+def read_player_version() -> str:
+    ps = find_player_script()
+    if not ps:
+        return ""
+    try:
+        head = ps.read_text(encoding="utf-8", errors="ignore")[:4000]
+        m = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', head)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+def parse_version(v: str) -> tuple:
+    """'0.3.10' -> (0, 3, 10); нечисловые части отбрасываются."""
+    parts = []
+    for chunk in re.findall(r"\d+", str(v))[:4]:
+        parts.append(int(chunk))
+    return tuple(parts) if parts else (0,)
+
+
+def expand_dir(text: str) -> Path:
+    """Текст из комбобокса -> Path (с раскрытием %LOCALAPPDATA% и ~)."""
+    t = str(text).strip().strip('"')
+    t = t.split("  —  ")[0].strip()  # убираем подпись пресета
+    t = os.path.expandvars(os.path.expanduser(t))
+    return Path(t)
+
+
+# ------------------------------------------------------------------
+# Поиск локальных источников установки (автономный режим)
+# ------------------------------------------------------------------
+def launcher_dirs() -> List[Path]:
+    """Каталоги, где лаунчер ищет установщик/пейлоад рядом с собой."""
+    here = Path(__file__).resolve().parent
+    out = [here, here.parent, Path.cwd()]
+    uniq: List[Path] = []
+    for d in out:
+        if d not in uniq:
+            uniq.append(d)
+    return uniq
+
+
+def find_local_setup() -> Optional[Path]:
+    """Hox-Setup[-Win7].exe рядом с лаунчером (offline-установка)."""
+    names = [SETUP_EXE]
+    alt = "Hox-Setup-Win7.exe" if not IS_WIN7_BUILD else "Hox-Setup.exe"
+    names.append(alt)
+    for d in launcher_dirs():
+        for n in names:
+            p = d / n
+            if p.is_file():
+                return p
+    return None
+
+
+def find_local_payload_zip() -> Optional[Path]:
+    """Hox-Payload-*.zip рядом с лаунчером (offline-установка)."""
+    best: Optional[Path] = None
+    best_ver = (0,)
+    for d in launcher_dirs():
+        for p in d.glob("Hox-Payload-*.zip"):
+            m = re.search(r"(\d+(?:\.\d+)+)", p.name)
+            ver = parse_version(m.group(1)) if m else (0,)
+            if ver > best_ver:
+                best, best_ver = p, ver
+    return best
+
+
+def find_local_player_zip() -> Optional[Path]:
+    """Hox-Player-*.zip рядом с лаунчером (автономная установка плеера)."""
+    best: Optional[Path] = None
+    best_ver = (0,)
+    for d in launcher_dirs():
+        for p in d.glob("Hox-Player-*.zip"):
+            m = re.search(r"(\d+(?:\.\d+)+)", p.name)
+            ver = parse_version(m.group(1)) if m else (0,)
+            if ver > best_ver:
+                best, best_ver = p, ver
+    return best
+
+
+def shots_dirs() -> List[Path]:
+    """Где искать скриншоты для галереи."""
+    here = Path(__file__).resolve().parent
+    return [here / "launcher_shots", here.parent / "app" / "launcher_shots",
+            here / "shots", here / "media"]
+
+
+def find_shot(name: str) -> Optional[Path]:
+    for d in shots_dirs():
+        p = d / name
+        if p.is_file():
+            return p
+    return None
+
+
+# ------------------------------------------------------------------
+# GitHub Releases (архив плеера берётся с GitHub — актуальная версия)
+# ------------------------------------------------------------------
+def github_latest(repo: str) -> Optional[Dict[str, Any]]:
+    """Последний релиз: {version, notes, asset_url, asset_name, sha_url}."""
+    url = "https://api.github.com/repos/" + repo.strip() + "/releases/latest"
+    req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                               "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    tag = str(data.get("tag_name", "") or "")
+    version = tag.lstrip("vV")
+    if not version:
+        name = str(data.get("name", "") or "")
+        m = re.search(r"(\d+(?:\.\d+)+)", name)
+        version = m.group(1) if m else ""
+    if not version:
+        raise ValueError("в релизе нет версии (tag_name)")
+
+    # v3.0: лаунчер качает только архив плеера Hox-Player-<версия>.zip —
+    # он один и тот же для main- и Win7-сборки (чистый исходник Python).
+    assets = data.get("assets") or []
+    player_re = re.compile(r"^hox-player-(\d+(?:\.\d+)*)\.zip$")
+    picked, picked_ver = None, (0,)
+    for a in assets:
+        n = str(a.get("name", ""))
+        m = player_re.match(n.lower())
+        if not m:
+            continue
+        ver = tuple(int(x) for x in m.group(1).split("."))
+        if ver > picked_ver:
+            picked, picked_ver = a, ver
+    if picked is None:
+        raise ValueError("в релизе нет архива плеера Hox-Player-*.zip")
+    asset_url = str(picked.get("browser_download_url", ""))
+    asset_name = str(picked.get("name", ""))
+    sha_url = ""
+    for a in assets:
+        if str(a.get("name", "")) == asset_name + ".sha256":
+            sha_url = str(a.get("browser_download_url", ""))
+            break
+    notes = str(data.get("body", "") or "")
+    published = str(data.get("published_at", "") or "")
+    return {"version": version, "notes": notes, "asset_url": asset_url,
+            "asset_name": asset_name, "sha_url": sha_url, "published": published,
+            "html_url": str(data.get("html_url", "") or "")}
+
+
+def fetch_sha256(url: str) -> str:
+    """Скачивает *.sha256 и возвращает hex-дайджест из содержимого."""
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        text = r.read(4096).decode("utf-8", errors="ignore")
+    m = re.search(r"\b([0-9a-fA-F]{64})\b", text)
+    return m.group(1).lower() if m else ""
+
+
+def resolve_update_source(settings) -> Dict[str, Any]:
+    """Определяет источник обновлений. Приоритет: GitHub -> манифест.
+
+    Возвращает словарь-описание; при отсутствии источников — kind='none'.
+    Чистая функция сетевого I/O — вызывается из CheckWorker.
+    """
+    repo = str(settings.value("updates/github_repo", "") or "").strip() or GITHUB_REPO.strip()
+    murl = str(settings.value("updates/manifest_url", "") or "").strip()
+    result: Dict[str, Any] = {"kind": "none", "version": "", "notes": "",
+                              "url": "", "sha256": "", "source": ""}
+    if repo and "/" in repo:
+        try:
+            gh = github_latest(repo)
+            sha = ""
+            if gh.get("sha_url"):
+                try:
+                    sha = fetch_sha256(str(gh["sha_url"]))
+                except Exception:
+                    sha = ""
+            result.update({"kind": "github", "version": gh["version"],
+                           "notes": gh["notes"], "url": gh["asset_url"],
+                           "asset_name": gh["asset_name"], "sha256": sha,
+                           "published": gh.get("published", ""),
+                           "html_url": gh.get("html_url", ""),
+                           "source": "GitHub: " + repo})
+            return result
+        except Exception:
+            pass  # падаем на манифест
+    if murl:
+        try:
+            req = urllib.request.Request(murl, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            if not isinstance(data, dict) or not data.get("url") or not data.get("version"):
+                raise ValueError("манифест без version/url")
+            url = str(data.get("url", ""))
+            if IS_WIN7_BUILD:
+                url = str(data.get("url_win7", "") or url)
+            result.update({"kind": "manifest", "version": str(data.get("version", "")),
+                           "notes": str(data.get("notes", "") or ""), "url": url,
+                           "sha256": str(data.get("sha256", "") or ""),
+                           "source": "манифест"})
+            return result
+        except Exception:
+            pass
+    return result
+
+
+# ------------------------------------------------------------------
+# Ярлыки и деинсталлятор (для установки, выполненной самим лаунчером)
+# ------------------------------------------------------------------
+PS_SHORTCUTS = r"""$ErrorActionPreference = 'SilentlyContinue'
+$ws = New-Object -ComObject WScript.Shell
+$desktop = $ws.SpecialFolders('Desktop')
+$smprog = $ws.SpecialFolders('StartMenu') + '\Programs'
+$base = '{base}'
+$rt = $base + '\runtime\python'
+$app = $base + '\app'
+function Mk($lnk, $tgt, $arg, $dir, $ico) {{
+  $s = $ws.CreateShortcut($lnk)
+  $s.TargetPath = $tgt
+  if ($arg) {{ $s.Arguments = $arg }}
+  $s.WorkingDirectory = $dir
+  $s.IconLocation = $ico + ',0'
+  $s.Save()
+}}
+New-Item -ItemType Directory -Force -Path ($smprog + '\Hox') | Out-Null
+Mk ($desktop + '\Hox.lnk') ($rt + '\Hox.exe') ('"' + $app + '\Hox-Launcher.pyw"') $app ($app + '\hox.ico')
+Mk ($smprog + '\Hox\Hox Music Player.lnk') ($rt + '\Hox.exe') ('"' + $app + '\hox_music_player.py"') $app ($app + '\hox.ico')
+Mk ($smprog + '\Hox\Hox Launcher.lnk') ($rt + '\pythonw.exe') ('"' + $app + '\Hox-Launcher.pyw"') $app ($app + '\hox.ico')
+"""
+
+
+def make_shortcuts(base: Path, desktop: bool, startmenu: bool, log: Callable[[str], None]) -> None:
+    """Ярлыки плеера: рабочий стол и/или меню «Пуск» (WScript.Shell)."""
+    if os.name != "nt":
+        log("Ярлыки: пропущены (не Windows)")
+        return
+    ps = PS_SHORTCUTS.format(base=str(base))
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-Command", ps],
+                       capture_output=True, text=True, timeout=60,
+                       creationflags=CREATE_NO_WINDOW, check=False)
+        if not desktop:
+            subprocess.run(["powershell", "-NoProfile", "-Command",
+                            "Remove-Item -LiteralPath ((New-Object -ComObject "
+                            "WScript.Shell).SpecialFolders('Desktop') + '\\Hox.lnk') "
+                            "-Force -ErrorAction SilentlyContinue"],
+                           capture_output=True, timeout=30,
+                           creationflags=CREATE_NO_WINDOW, check=False)
+        if not startmenu:
+            subprocess.run(["powershell", "-NoProfile", "-Command",
+                            "Remove-Item -LiteralPath ((New-Object -ComObject "
+                            "WScript.Shell).SpecialFolders('StartMenu') + '\\Programs\\Hox') "
+                            "-Recurse -Force"],
+                           capture_output=True, timeout=30,
+                           creationflags=CREATE_NO_WINDOW, check=False)
+        log("Ярлыки: рабочий стол — " + ("создан" if desktop else "не создавать")
+            + "; меню «Пуск» — " + ("создан" if startmenu else "не создавать"))
+    except Exception as e:  # noqa: BLE001
+        log("Ярлыки: не удалось создать (" + str(e) + ")")
+
+
+UNINSTALL_VBS = """' Деинсталлятор Hox Music Player (создан лаунчером v{lv})
+Option Explicit
+Dim sh, fso, desk, sms
+Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+On Error Resume Next
+sh.Run "taskkill /F /IM Hox.exe /T", 0, True
+Set desk = fso.GetFolder(sh.SpecialFolders("Desktop"))
+If fso.FileExists(desk & "\\Hox.lnk") Then fso.DeleteFile desk & "\\Hox.lnk", True
+Set sms = fso.GetFolder(sh.SpecialFolders("StartMenu") & "\\Programs\\Hox")
+If fso.FolderExists(sms) Then fso.DeleteFolder sms, True
+sh.Run "reg delete ""HKCU\\{uk}"" /f", 0, True
+sh.Run "reg delete ""HKCU\\{rh}"" /f", 0, True
+MsgBox "Hox Music Player удалён.", vbInformation, "Hox"
+q = Chr(34)
+del = "cmd /c ping -n 2 127.0.0.1 >nul & rmdir /s /q " & q & "{base}" & q
+sh.Run del, 0, False
+"""
+
+
+def register_uninstaller(base: Path, log: Callable[[str], None]) -> None:
+    """Регистрация деинсталлятора для установки, сделанной лаунчером
+    (тот же ключ реестра, что и у Hox-Setup.exe)."""
+    if os.name != "nt":
+        log("Деинсталлятор: пропущен (не Windows)")
+        return
+    try:
+        vbs = base / "Uninstall-Hox.vbs"
+        vbs.write_text(UNINSTALL_VBS.format(lv=LAUNCHER_VERSION, uk=UNINST_KEY,
+                                            rh=REG_HOME, base=str(base)),
+                       encoding="cp1251", errors="replace")
+        exe = str(base / "runtime" / "python" / "Hox.exe")
+        ico = str(base / "app" / "hox.ico")
+        size_kb = 0
+        for f in base.rglob("*"):
+            try:
+                if f.is_file():
+                    size_kb += f.stat().st_size // 1024
+            except Exception:
+                pass
+        cmds = [
+            ["reg", "add", "HKCU\\" + UNINST_KEY, "/v", "DisplayName",
+             "/t", "REG_SZ", "/d", "Hox Music Player", "/f"],
+            ["reg", "add", "HKCU\\" + UNINST_KEY, "/v", "DisplayVersion",
+             "/t", "REG_SZ", "/d", read_player_version() or "0.0.0", "/f"],
+            ["reg", "add", "HKCU\\" + UNINST_KEY, "/v", "Publisher",
+             "/t", "REG_SZ", "/d", "Hox", "/f"],
+            ["reg", "add", "HKCU\\" + UNINST_KEY, "/v", "DisplayIcon",
+             "/t", "REG_SZ", "/d", ico + ",0", "/f"],
+            ["reg", "add", "HKCU\\" + UNINST_KEY, "/v", "InstallLocation",
+             "/t", "REG_SZ", "/d", str(base), "/f"],
+            ["reg", "add", "HKCU\\" + UNINST_KEY, "/v", "UninstallString",
+             "/t", "REG_SZ", "/d", "wscript.exe \"" + str(vbs) + "\"", "/f"],
+            ["reg", "add", "HKCU\\" + UNINST_KEY, "/v", "QuietUninstallString",
+             "/t", "REG_SZ", "/d", "wscript.exe \"" + str(vbs) + "\"", "/f"],
+            ["reg", "add", "HKCU\\" + UNINST_KEY, "/v", "NoModify",
+             "/t", "REG_DWORD", "/d", "1", "/f"],
+            ["reg", "add", "HKCU\\" + UNINST_KEY, "/v", "NoRepair",
+             "/t", "REG_DWORD", "/d", "1", "/f"],
+            ["reg", "add", "HKCU\\" + UNINST_KEY, "/v", "EstimatedSize",
+             "/t", "REG_DWORD", "/d", str(size_kb), "/f"],
+            ["reg", "add", "HKCU\\" + REG_HOME, "/v", "InstallDir",
+             "/t", "REG_SZ", "/d", str(base), "/f"],
+        ]
+        for c in cmds:
+            subprocess.run(c, capture_output=True, timeout=20,
+                           creationflags=CREATE_NO_WINDOW, check=False)
+        log("Деинсталлятор зарегистрирован: Uninstall-Hox.vbs + ключ «Установка и удаление программ»")
+    except Exception as e:  # noqa: BLE001
+        log("Деинсталлятор: не удалось зарегистрировать (" + str(e) + ")")
+
+
+def count_files(root: Path) -> int:
+    n = 0
+    try:
+        for _ in root.rglob("*"):
+            n += 1
+    except Exception:
+        pass
+    return n
+
+
+# ------------------------------------------------------------------
+# Qt-импорты (PyQt6; на Win7 их отдаёт fake-пакет pyqt6_compat)
+# ------------------------------------------------------------------
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QProgressBar, QMessageBox, QFileDialog, QComboBox,
+    QCheckBox, QGroupBox, QScrollArea, QTextEdit, QFrame, QDialog
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
+from PyQt6.QtGui import QPixmap, QPainter, QColor, QLinearGradient, QPen, QFont, QIcon
+
+
+class _SettingsShim:
+    """Заглушка QSettings для воркера: заранее извлечённые значения,
+    чтобы не трогать QSettings из чужого потока."""
+
+    def __init__(self, repo: str, murl: str):
+        self._repo, self._murl = repo, murl
+
+    def value(self, key: str, default: str = "") -> str:
+        if key == "updates/github_repo":
+            return self._repo
+        return self._murl
+
+
+class CheckWorker(QThread):
+    """Фоновое определение источника обновлений (GitHub -> манифест)."""
+    resolved = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, repo: str, murl: str, parent=None):
+        super().__init__(parent)
+        self.repo, self.murl = repo, murl
+
+    def run(self):
+        try:
+            src = resolve_update_source(_SettingsShim(self.repo, self.murl))
+            self.resolved.emit(src)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
+
+
+class DownloadWorker(QThread):
+    """Скачивание пакета обновления с прогрессом и проверкой SHA-256."""
+    stage = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    done_ok = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, url: str, dest: Path, sha256: str = "", parent=None):
+        super().__init__(parent)
+        self.url, self.dest, self.sha256 = url, dest, sha256
+
+    def run(self):
+        try:
+            req = urllib.request.Request(self.url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                total = int(resp.headers.get("Content-Length", 0) or 0)
+                done = 0
+                hasher = hashlib.sha256()
+                with open(self.dest, "wb") as f:
+                    while True:
+                        chunk = resp.read(256 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        hasher.update(chunk)
+                        done += len(chunk)
+                        if total:
+                            pct = int(done * 100 / total)
+                            self.progress.emit(pct)
+                            if pct % 5 == 0:
+                                self.stage.emit("Скачиваю: {:.1f} из {:.1f} МБ".format(
+                                    done / 1048576.0, total / 1048576.0))
+            if self.sha256:
+                got = hasher.hexdigest().lower()
+                if got != self.sha256.lower():
+                    raise ValueError("контрольная сумма не совпала ({}…)".format(got[:12]))
+            self.done_ok.emit(str(self.dest))
+        except Exception as e:  # noqa: BLE001
+            try:
+                if Path(self.dest).exists():
+                    Path(self.dest).unlink()
+            except Exception:
+                pass
+            self.failed.emit(str(e))
+
+
+def _zip_contains_installer(zf: zipfile.ZipFile) -> bool:
+    """zip с установщиком внутри (один .exe в корне) vs zip-пейлоад."""
+    for n in zf.namelist():
+        base = n.replace("\\", "/").split("/")[-1]
+        if base.lower().endswith(".exe") and "/" not in n.replace("\\", "/"):
+            return True
+    return False
+
+
+def _write_update_cmd(base: Path, tmp: Path) -> Path:
+    """cmd-скрипт самообновления: ждёт закрытия лаунчера, копирует файлы,
+    подчищает tmp и перезапускает лаунчер."""
+    cmd = base / "update_hox.cmd"
+    pyw = base / "runtime" / "python" / "pythonw.exe"
+    lines = [
+        "@echo off",
+        "ping -n 3 127.0.0.1 >nul",
+        'xcopy /y /e /i /q "{}\\app" "{}\\app\\" >nul'.format(tmp, base),
+        'xcopy /y /e /i /q "{}\\runtime" "{}\\runtime\\" >nul'.format(tmp, base),
+        'if exist "{0}\\support" xcopy /y /e /i /q "{0}\\support" "{1}\\support\\" >nul'.format(tmp, base),
+        "rmdir /s /q \"{}\"".format(tmp),
+        'start "" "{}" "{}\\Hox-Launcher.pyw"'.format(pyw, base / "app"),
+        "del \"%~f0\"",
+    ]
+    cmd.write_text("\r\n".join(lines) + "\r\n", encoding="cp866", errors="replace")
+    return cmd
+
+
+class InstallWorker(QThread):
+    """Установка плеера в выбранную папку — прямо из лаунчера.
+
+    kind='player'   — файлы плеера из Hox-Player-*.zip в <папка>\\app
+                      (лёгкое обновление: runtime и ярлыки не трогаем);
+    kind='zip'      — распаковка пейлоада (или установщика из zip) с
+                      пофайловым прогрессом;
+    kind='selfcopy' — копирование собственной установки в новую папку
+                      (перенос/восстановление без интернета);
+    kind='setup'    — тихая установка Hox-Setup.exe (/S /D=) с опросом
+                      числа файлов для прогресса.
+    """
+    stage = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    done_ok = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, kind: str, target: Path, desktop: bool, startmenu: bool,
+                 zip_path: Optional[Path] = None, setup_path: Optional[Path] = None,
+                 parent=None):
+        super().__init__(parent)
+        self.kind = kind
+        self.target = target
+        self.desktop = desktop
+        self.startmenu = startmenu
+        self.zip_path = zip_path
+        self.setup_path = setup_path
+        self._cancelled = False
+
+    def log(self, msg: str) -> None:
+        self.stage.emit(msg)
+
+    # ---------- zip ----------
+
+    def run_zip(self) -> None:
+        own = find_install_base()
+        target = self.target
+        with zipfile.ZipFile(self.zip_path) as zf:
+            if _zip_contains_installer(zf):
+                # zip-обёртка установщика: распаковать во временную и запустить /S /D=
+                self.log("В архиве установщик — распаковываю во временную папку…")
+                tmpd = Path(tempfile.mkdtemp(prefix="Hox-setup-"))
+                zf.extractall(tmpd)
+                exe = None
+                for p in tmpd.rglob("*.exe"):
+                    exe = p
+                    break
+                if exe is None:
+                    raise ValueError("установщик в архиве не найден")
+                self.run_setup_exe(exe)
+                try:
+                    shutil.rmtree(tmpd, ignore_errors=True)
+                except Exception:
+                    pass
+                return
+            names = [i for i in zf.infolist() if not i.is_dir()]
+            if own is not None and target.resolve() == Path(own).resolve():
+                # самообновление текущей копии: через update_hox.cmd
+                self.log("Обновляю текущую установку (файлы заменит командный скрипт)…")
+                tmp = target / "update_tmp"
+                if tmp.exists():
+                    shutil.rmtree(tmp, ignore_errors=True)
+                for i, info in enumerate(names):
+                    zf.extract(info, tmp)
+                    self.progress.emit(int((i + 1) * 100 / max(1, len(names))))
+                cmd = _write_update_cmd(target, tmp)
+                subprocess.Popen(["cmd", "/c", str(cmd)],
+                                 creationflags=CREATE_NO_WINDOW, cwd=str(target))
+                self.done_ok.emit("Обновление применится через пару секунд — "
+                                  "лаунчер перезапустится автоматически.")
+                return
+            # обычная установка/обновление в выбранную папку
+            n = len(names)
+            skipped = 0
+            for i, info in enumerate(names):
+                dest = target / info.filename
+                try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info) as srcf, open(dest, "wb") as dstf:
+                        shutil.copyfileobj(srcf, dstf)
+                except PermissionError:
+                    skipped += 1  # файл занят (например, сам pythonw.exe)
+                except OSError as e:
+                    if getattr(e, "winerror", None) in (5, 32):  # доступ/занято
+                        skipped += 1
+                    else:
+                        raise
+                self.progress.emit(int((i + 1) * 100 / max(1, n)))
+                if i % 50 == 0:
+                    self.log("Распаковка: {}/{} файлов".format(i + 1, n))
+            self.log("Распаковано {} файлов{}".format(
+                n, ", пропущено занятых: {}".format(skipped) if skipped else ""))
+        ver = read_player_version()
+        register_uninstaller(target, self.log)
+        make_shortcuts(target, self.desktop, self.startmenu, self.log)
+        if os.name == "nt" and not Path(os.environ.get("WINDIR", "C:\\Windows")) \
+                .joinpath("System32", "ucrtbase.dll").exists() and \
+                (target / "support" / "vc_redist.x86.exe").is_file():
+            self.log("Внимание: в системе нет ucrtbase.dll — запустите "
+                     "support\\vc_redist.x86.exe из папки установки (Windows 7).")
+        self.done_ok.emit("Плеер {}установлен: {}".format(
+            "пере" if own is not None else "", target) +
+            ("\nВерсия плеера: v" + ver if ver else ""))
+
+    # ---------- player zip (только файлы плеера) ----------
+
+    def run_player_install(self) -> None:
+        """Установка/обновление плеера из Hox-Player-*.zip: распаковка
+        файлов плеера в <папка>\\app (runtime и ярлыки не трогаются)."""
+        app_dir = self.target / "app"
+        app_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(self.zip_path) as zf:
+            names = [i for i in zf.infolist() if not i.is_dir()]
+            # если архив собран с общей папкой сверху — срезаем её
+            tops = set()
+            for n in names:
+                tops.add(n.filename.replace("\\", "/").split("/")[0])
+            strip = ""
+            if len(tops) == 1 and any("/" in n.filename.replace("\\", "/")
+                                      for n in names):
+                strip = tops.pop() + "/"
+            safe = []
+            for info in names:
+                rel = info.filename.replace("\\", "/")
+                if strip:
+                    if not rel.startswith(strip):
+                        continue
+                    rel = rel[len(strip):]
+                if not rel or rel.startswith("/") or ".." in rel.split("/"):
+                    continue  # защита от выхода за пределы app
+                if "/" in rel or rel.lower().endswith(".exe"):
+                    continue  # плеер — плоский набор исходников, без .exe
+                safe.append((info, rel))
+            if not any(rel.lower() == PLAYER_SCRIPT for _, rel in safe):
+                raise ValueError("в архиве нет " + PLAYER_SCRIPT)
+            n = len(safe)
+            skipped = 0
+            for i, (info, rel) in enumerate(safe):
+                dest = app_dir / rel
+                try:
+                    with zf.open(info) as srcf, open(dest, "wb") as dstf:
+                        shutil.copyfileobj(srcf, dstf)
+                except PermissionError:
+                    skipped += 1  # файл занят — не мешает остальным
+                except OSError as e:
+                    if getattr(e, "winerror", None) in (5, 32):
+                        skipped += 1
+                    else:
+                        raise
+                self.progress.emit(int((i + 1) * 100 / max(1, n)))
+            self.log("Файлов плеера установлено: {}{}".format(
+                n - skipped,
+                ", пропущено занятых: {}".format(skipped) if skipped else ""))
+        ver = read_player_version()
+        self.done_ok.emit("Плеер установлен: v{}\nПапка: {}".format(
+            ver or "?", app_dir))
+
+    # ---------- selfcopy ----------
+
+    def run_selfcopy(self) -> None:
+        own = find_install_base()
+        if own is None:
+            raise ValueError("собственная установка не найдена — нечего копировать")
+        own = Path(own)
+        if own.resolve() == self.target.resolve():
+            self.done_ok.emit("Плеер уже установлен в эту папку.")
+            return
+        subdirs = [d for d in ("app", "runtime", "support") if (own / d).is_dir()]
+        allfiles: List[Path] = []
+        for d in subdirs:
+            allfiles.extend([p for p in (own / d).rglob("*") if p.is_file()])
+        n = len(allfiles)
+        if n == 0:
+            raise ValueError("в собственной установке нет файлов")
+        for i, src in enumerate(allfiles):
+            rel = src.relative_to(own)
+            dest = self.target / rel
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
+            except PermissionError:
+                pass  # занятые файлы не мешают остальным
+            self.progress.emit(int((i + 1) * 100 / n))
+            if i % 100 == 0:
+                self.log("Копирование: {}/{} файлов".format(i + 1, n))
+        self.log("Скопировано {} файлов".format(n))
+        register_uninstaller(self.target, self.log)
+        make_shortcuts(self.target, self.desktop, self.startmenu, self.log)
+        ver = read_player_version()
+        self.done_ok.emit("Плеер установлен: {}\nВерсия плеера: v{}".format(
+            self.target, ver or "?"))
+
+    # ---------- setup /S /D ----------
+
+    def run_setup_exe(self, exe: Optional[Path] = None) -> None:
+        exe = exe or self.setup_path
+        if exe is None:
+            raise ValueError("установщик не найден")
+        self.log("Запускаю тихую установку: {}".format(exe.name))
+        self.stage.emit("Установщик заменит файлы и перезапустит лаунчер — "
+                        "это нормально, окно откроется само.")
+        # /D обязан идти последним аргументом и БЕЗ кавычек (требование NSIS)
+        cmdline = '"{}" /S /D={}'.format(exe, self.target)
+        proc = subprocess.Popen(cmdline, creationflags=CREATE_NO_WINDOW)
+        while True:
+            if proc.poll() is not None:
+                break
+            found = count_files(self.target)
+            self.progress.emit(min(95, int(found * 100 / EST_FILES)))
+            time.sleep(1.0)
+        self.progress.emit(100)
+        if not (self.target / "app" / PLAYER_SCRIPT).is_file():
+            raise ValueError("установщик завершился, но файлы плеера не появились")
+        # NSIS создал все ярлыки сам — применяем выбор пользователя
+        if os.name == "nt":
+            ps_del = []
+            if not self.desktop:
+                ps_del.append(
+                    "Remove-Item -LiteralPath ((New-Object -ComObject WScript.Shell)"
+                    ".SpecialFolders('Desktop') + '\\Hox.lnk') -Force")
+            if not self.startmenu:
+                ps_del.append(
+                    "Remove-Item -LiteralPath ((New-Object -ComObject WScript.Shell)"
+                    ".SpecialFolders('StartMenu') + '\\Programs\\Hox') -Recurse -Force")
+            for c in ps_del:
+                subprocess.run(["powershell", "-NoProfile", "-Command", c],
+                               capture_output=True, timeout=30,
+                               creationflags=CREATE_NO_WINDOW, check=False)
+        self.log("Ярлыки: " + ("рабочий стол + " if self.desktop else "")
+                 + ("меню «Пуск»" if self.startmenu else "по выбору пользователя"))
+        ver = read_player_version()
+        self.done_ok.emit("Плеер {}установлен: {}\nВерсия плеера: v{}".format(
+            "пере" if find_install_base() else "", self.target, ver or "?"))
+
+    def run(self):
+        try:
+            self.target.mkdir(parents=True, exist_ok=True)
+            if self.kind == "player":
+                self.run_player_install()
+            elif self.kind == "zip":
+                self.run_zip()
+            elif self.kind == "selfcopy":
+                self.run_selfcopy()
+            elif self.kind == "setup":
+                self.run_setup_exe()
+            else:
+                raise ValueError("неизвестный тип установки: " + self.kind)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
+
+
+# ------------------------------------------------------------------
+# Логотип (та же пластика, что у плеера)
+# ------------------------------------------------------------------
+def draw_logo(size: int = 96) -> QPixmap:
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    r = size * 0.18
+    grad = QLinearGradient(0, 0, size, size)
+    grad.setColorAt(0.0, QColor(BG2))
+    grad.setColorAt(1.0, QColor("#0b0e18"))
+    p.setBrush(grad)
+    p.setPen(QPen(QColor(ACCENT), max(1.0, size * 0.02)))
+    p.drawRoundedRect(int(size * 0.04), int(size * 0.04),
+                      int(size * 0.92), int(size * 0.92), int(r), int(r))
+    bars = [0.42, 0.68, 0.52, 0.82, 0.60]
+    bw = size * 0.09
+    gap = size * 0.055
+    total = len(bars) * bw + (len(bars) - 1) * gap
+    x = (size - total) / 2
+    base_y = size * 0.72
+    for i, h_frac in enumerate(bars):
+        h = size * h_frac * 0.62
+        p.setBrush(QColor(ACCENT) if i % 2 == 0 else QColor(ACCENT2))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(int(x), int(base_y - h), int(bw), int(h), 2, 2)
+        x += bw + gap
+    p.end()
+    return pm
+
+
+def news_html(extra_head: str = "") -> str:
+    """Встроенные новости -> HTML (свежая версия — акцентом, старые — глуше)."""
+    parts = [extra_head] if extra_head else []
+    for i, (ver, items) in enumerate(NEWS):
+        head_color = ACCENT if i == 0 else MUTED
+        parts.append("<p style='margin:10px 0 3px 0;'><b style='color:{0};"
+                     "font-size:13px;'>v{1} — что нового</b></p>".format(head_color, ver))
+        for it in items:
+            parts.append("<p style='margin:3px 0 3px 14px;'>• {}</p>".format(it))
+    return "".join(parts)
+
+
+def release_notes_html(src: Dict[str, Any]) -> str:
+    """Заметки релиза с GitHub -> HTML-блок для верха новостной ленты."""
+    notes = str(src.get("notes", "") or "").strip()
+    head = "<p style='margin:8px 0 2px 0;'><b style='color:{};'>v{} — заметки " \
+           "релиза ({})</b></p>".format(WARN, src.get("version", "?"),
+                                        src.get("source", ""))
+    if not notes:
+        return head + "<p style='margin:2px 0 2px 12px;color:{};'>Без описания.</p>".format(MUTED)
+    esc = notes.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return head + "<p style='margin:2px 0 2px 12px;white-space:pre-wrap;'>" + esc + "</p>"
+
+
+# ------------------------------------------------------------------
+# Главное окно лаунчера
+# ------------------------------------------------------------------
+LAUNCHER_QSS = """
+    QMainWindow, QDialog {{
+        background: qlineargradient(y1:0, y2:1, stop:0 {bg}, stop:1 #0b0e19);
+        color: {text};
+    }}
+    QLabel {{ color: {text}; }}
+    QLabel#TitleLabel {{ font-size: 19px; font-weight: bold; color: #ffffff; }}
+    QLabel#SubLabel {{ color: {muted}; font-size: 11px; }}
+    QLabel#SectionLabel {{ color: {accent}; font-size: 11px; font-weight: bold;
+                           letter-spacing: 2px; }}
+    QLabel#ShotCaption {{ color: {muted}; font-size: 10px; }}
+    QLabel#BetaBadge {{
+        color: {bg}; background-color: {warn};
+        border-radius: 10px; padding: 4px 12px;
+        font-size: 11px; font-weight: bold; letter-spacing: 1px;
+    }}
+    QFrame#StatusCard {{
+        background-color: {bg2}; border: 1px solid {border};
+        border-left: 3px solid {accent};
+        border-radius: 8px;
+    }}
+    QLabel#StatusLabel {{ font-size: 13px; }}
+    QLabel#UpdateLabel {{ font-size: 12px; color: {muted}; }}
+    QTextEdit#NewsBox, QTextEdit#LogBox {{
+        background-color: {bg2}; color: {text};
+        border: 1px solid {border}; border-radius: 8px;
+        padding: 6px 8px;
+    }}
+    QTextEdit#LogBox {{ font-family: 'Consolas', 'Courier New', monospace;
+                        font-size: 11px; color: {muted}; }}
+    QScrollArea#ShotsArea {{ border: none; background: transparent; }}
+    QWidget#ShotsRow {{ background: transparent; }}
+    QScrollBar:vertical {{ background: transparent; width: 8px; margin: 0; }}
+    QScrollBar::handle:vertical {{ background: #2a3252; border-radius: 4px;
+                                   min-height: 24px; }}
+    QScrollBar::handle:vertical:hover {{ background: {accent2}; }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
+    QScrollBar:horizontal {{ background: transparent; height: 8px; margin: 0; }}
+    QScrollBar::handle:horizontal {{ background: #2a3252; border-radius: 4px;
+                                     min-width: 24px; }}
+    QScrollBar::handle:horizontal:hover {{ background: {accent2}; }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+    QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: none; }}
+    QPushButton {{ background-color: {bg2}; color: {text};
+                   border: 1px solid {border}; border-radius: 7px;
+                   padding: 8px 16px; font-size: 13px; }}
+    QPushButton:hover {{ border-color: {accent}; color: {accent};
+                         background-color: {bg3}; }}
+    QPushButton:disabled {{ color: {muted}; border-color: #2a2f47;
+                            background-color: {bg2}; }}
+    QPushButton#LaunchButton {{
+        background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+            stop:0 #00e5ff, stop:1 #00a8d8);
+        color: #061018; font-weight: bold; font-size: 14px;
+        border: none; border-radius: 8px; padding: 11px 18px;
+    }}
+    QPushButton#LaunchButton:hover {{
+        background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+            stop:0 #33ecff, stop:1 #00c0ee);
+        color: #061018;
+    }}
+    QPushButton#LaunchButton:disabled {{ background-color: {bg3};
+                                         color: {muted}; }}
+    QPushButton#InstallButton {{ border-color: {accent2};
+                                 color: #b9c6ff; font-weight: bold; }}
+    QPushButton#InstallButton:hover {{ border-color: {accent}; color: {accent}; }}
+    QPushButton#ShotButton {{ background-color: {bg2}; border: 1px solid {border};
+                              border-radius: 6px; padding: 2px; }}
+    QPushButton#ShotButton:hover {{ border-color: {accent};
+                                    background-color: #0e1428; }}
+    QComboBox {{ background-color: {bg2}; color: {text};
+                 border: 1px solid {border}; border-radius: 7px;
+                 padding: 6px 10px; font-size: 12px; }}
+    QComboBox:hover {{ border-color: {accent}; }}
+    QComboBox::drop-down {{ border: none; width: 22px; }}
+    QComboBox QAbstractItemView {{ background-color: {bg2};
+                                   color: {text};
+                                   selection-background-color: {bg3}; }}
+    QCheckBox {{ color: {text}; font-size: 12px; spacing: 6px; }}
+    QCheckBox::indicator {{ width: 15px; height: 15px; border-radius: 4px;
+                            border: 1px solid {border};
+                            background: {bg}; }}
+    QCheckBox::indicator:hover {{ border-color: {accent}; }}
+    QCheckBox::indicator:checked {{ background: {accent};
+                                    border-color: {accent}; }}
+    QGroupBox {{ color: {text}; background-color: {bg2};
+                 border: 1px solid {border}; border-radius: 10px;
+                 margin-top: 10px; padding: 10px 8px 8px 8px;
+                 font-size: 12px; font-weight: bold; }}
+    QGroupBox::title {{ subcontrol-origin: margin; left: 12px;
+                        padding: 0 5px; color: {accent}; }}
+    QProgressBar {{ background-color: {bg2}; border: 1px solid {border};
+                    border-radius: 8px; text-align: center; color: {text};
+                    font-size: 11px; min-height: 18px; }}
+    QProgressBar::chunk {{ border-radius: 7px;
+        background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+            stop:0 #00e5ff, stop:1 #3d5afe); }}
+""".format(bg=BG, bg2=BG2, bg3=BG3, border=BORDER, accent=ACCENT,
+           accent2=ACCENT2, text=TEXT, muted=MUTED, warn=WARN)
+
+
+class ShotPreview(QDialog):
+    """Просмотр скриншота крупно (клик — закрыть)."""
+
+    def __init__(self, pm: QPixmap, caption: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(caption or "Скриншот")
+        self.setStyleSheet("background-color: #0b0e18;")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        img = QLabel()
+        img.setPixmap(pm)
+        img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(img)
+        cap = QLabel(caption)
+        cap.setStyleSheet("color: {}; font-size: 12px;".format(MUTED))
+        cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(cap)
+
+
+class LauncherWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_TITLE)
+        self.setWindowIcon(QIcon(draw_logo(64)))
+        self.setFixedSize(880, 816)
+        self.setStyleSheet(LAUNCHER_QSS)
+
+        self.settings = QSettings(str(app_base() / "launcher.ini"),
+                                  QSettings.Format.IniFormat)
+        self._busy = False
+        self._installed = False
+        self._auto_launch_after = False
+        self._pending: Optional[Dict[str, Any]] = None
+        self._downloaded: Optional[Path] = None
+        self._check_thread: Optional[QThread] = None
+        self._download_thread: Optional[QThread] = None
+        self._install_thread: Optional[QThread] = None
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(18, 14, 18, 12)
+        root.setSpacing(8)
+
+        # --- шапка ---
+        head = QHBoxLayout()
+        logo = QLabel()
+        logo.setPixmap(draw_logo(56))
+        head.addWidget(logo)
+        tcol = QVBoxLayout()
+        t = QLabel("Hox Music Player")
+        t.setObjectName("TitleLabel")
+        sub = QLabel("Лаунчер v{} — установка, обновления, новости".format(LAUNCHER_VERSION))
+        sub.setObjectName("SubLabel")
+        tcol.addWidget(t)
+        tcol.addWidget(sub)
+        head.addLayout(tcol, 1)
+        badge = QLabel("РАННЯЯ БЕТА")
+        badge.setObjectName("BetaBadge")
+        head.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
+        root.addLayout(head)
+
+        # --- карточка состояния ---
+        card = QFrame()
+        card.setObjectName("StatusCard")
+        clay = QVBoxLayout(card)
+        clay.setContentsMargins(12, 8, 12, 8)
+        clay.setSpacing(2)
+        self.status_label = QLabel("Проверяю состояние…")
+        self.status_label.setObjectName("StatusLabel")
+        self.status_label.setWordWrap(True)
+        self.update_label = QLabel("")
+        self.update_label.setObjectName("UpdateLabel")
+        self.update_label.setWordWrap(True)
+        clay.addWidget(self.status_label)
+        clay.addWidget(self.update_label)
+        root.addWidget(card)
+
+        # --- новости ---
+        nl = QLabel("НОВОСТИ ВЕРСИЙ")
+        nl.setObjectName("SectionLabel")
+        root.addWidget(nl)
+        self.news_box = QTextEdit()
+        self.news_box.setObjectName("NewsBox")
+        self.news_box.setReadOnly(True)
+        self.news_box.setHtml(news_html())
+        self.news_box.setFixedHeight(148)
+        root.addWidget(self.news_box)
+
+        # --- скриншоты ---
+        self.shots_title = QLabel("СКРИНШОТЫ")
+        self.shots_title.setObjectName("SectionLabel")
+        root.addWidget(self.shots_title)
+        self.shots_area = QScrollArea()
+        self.shots_area.setObjectName("ShotsArea")
+        self.shots_area.setWidgetResizable(True)
+        self.shots_area.setFixedHeight(130)
+        self.shots_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.shots_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        shots_row = QWidget()
+        shots_row.setObjectName("ShotsRow")
+        srow = QHBoxLayout(shots_row)
+        srow.setContentsMargins(0, 0, 0, 0)
+        srow.setSpacing(8)
+        shot_count = self._build_shots(srow)
+        self.shots_area.setWidget(shots_row)
+        root.addWidget(self.shots_area)
+        if shot_count == 0:
+            self.shots_area.hide()
+            self.shots_title.hide()
+
+        # --- установка ---
+        self.install_box = QGroupBox("Установка и обновление")
+        vbox = QVBoxLayout(self.install_box)
+        vbox.setContentsMargins(12, 14, 12, 8)
+        vbox.setSpacing(6)
+        row1 = QHBoxLayout()
+        row1.setSpacing(8)
+        row1.addWidget(QLabel("Папка установки:"))
+        self.dir_combo = QComboBox()
+        self.dir_combo.setMinimumWidth(280)
+        row1.addWidget(self.dir_combo, 1)
+        self.btn_browse = QPushButton("Обзор…")
+        self.btn_browse.clicked.connect(self.browse_dir)
+        row1.addWidget(self.btn_browse)
+        vbox.addLayout(row1)
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+        self.chk_desktop = QCheckBox("Ярлык на рабочем столе")
+        self.chk_desktop.setChecked(True)
+        row2.addWidget(self.chk_desktop)
+        self.chk_startmenu = QCheckBox("Ярлык в меню «Пуск»")
+        self.chk_startmenu.setChecked(True)
+        row2.addWidget(self.chk_startmenu)
+        row2.addStretch(1)
+        self.btn_install = QPushButton("Установить Hox")
+        self.btn_install.setObjectName("InstallButton")
+        self.btn_install.clicked.connect(self.on_install_clicked)
+        row2.addWidget(self.btn_install)
+        vbox.addLayout(row2)
+        root.addWidget(self.install_box)
+
+        # --- прогресс + открыть ---
+        prow = QHBoxLayout()
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        prow.addWidget(self.progress, 1)
+        self.btn_open = QPushButton("Открыть плеер")
+        self.btn_open.clicked.connect(self.launch_player)
+        prow.addWidget(self.btn_open)
+        root.addLayout(prow)
+
+        # --- запуск/проверка ---
+        brow = QHBoxLayout()
+        self.btn_launch = QPushButton("▶  Запустить плеер")
+        self.btn_launch.setObjectName("LaunchButton")
+        self.btn_launch.clicked.connect(self.launch_player)
+        brow.addWidget(self.btn_launch, 1)
+        self.btn_check = QPushButton("⟳  Проверить обновления")
+        self.btn_check.clicked.connect(self.check_updates)
+        brow.addWidget(self.btn_check)
+        root.addLayout(brow)
+
+        # --- журнал ---
+        self.log_box = QTextEdit()
+        self.log_box.setObjectName("LogBox")
+        self.log_box.setReadOnly(True)
+        self.log_box.setFixedHeight(76)
+        root.addWidget(self.log_box)
+
+        self._fill_dir_combo()
+        self.refresh_state()
+        self.log("Лаунчер v{} запущен (сборка плеера {})".format(
+            LAUNCHER_VERSION, "Win7" if IS_WIN7_BUILD else "основная"))
+        QTimer.singleShot(700, self.startup_check)
+
+    # ---------- скриншоты ----------
+
+    def _build_shots(self, lay: QHBoxLayout) -> int:
+        n = 0
+        for fname, caption in SHOTS:
+            p = find_shot(fname)
+            if not p or not p.is_file():
+                continue
+            pm = QPixmap(str(p))
+            if pm.isNull():
+                continue
+            cell = QWidget()
+            v = QVBoxLayout(cell)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(4)
+            btn = QPushButton()
+            btn.setObjectName("ShotButton")
+            thumb = pm.scaled(200, 100,
+                              Qt.AspectRatioMode.KeepAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation)
+            btn.setIcon(QIcon(thumb))
+            btn.setIconSize(thumb.size())
+            btn.setFixedSize(204, 106)
+            btn.setToolTip(caption)
+            btn.clicked.connect(lambda checked=False, p_=pm, c_=caption:
+                                self._show_shot(p_, c_))
+            v.addWidget(btn)
+            cap = QLabel(caption)
+            cap.setObjectName("ShotCaption")
+            cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cap.setFixedWidth(204)
+            v.addWidget(cap)
+            lay.addWidget(cell)
+            n += 1
+        lay.addStretch(1)
+        return n
+
+    def _show_shot(self, pm: QPixmap, caption: str) -> None:
+        scr = QApplication.primaryScreen()
+        maxw = int(scr.size().width() * 0.8) if scr else 1100
+        maxh = int(scr.size().height() * 0.8) if scr else 700
+        scaled = pm
+        if pm.width() > maxw or pm.height() > maxh:
+            scaled = pm.scaled(maxw, maxh, Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+        dlg = ShotPreview(scaled, caption, self)
+        dlg.setModal(True)
+        dlg.exec()
+
+    # ---------- журнал ----------
+
+    def log(self, msg: str) -> None:
+        stamp = time.strftime("%H:%M:%S")
+        self.log_box.append("[{}] {}".format(stamp, msg))
+
+    # ---------- состояние ----------
+
+    def _fill_dir_combo(self) -> None:
+        base = find_install_base()
+        local = local_appdata()
+        own = own_base()
+        self.dir_combo.clear()
+        if base is not None:
+            items = ["{}  —  текущая установка".format(base)]
+            if base.resolve() != own.resolve():
+                items.append("{}  —  папка лаунчера".format(own))
+        else:
+            items = ["{}  —  папка лаунчера".format(own)]
+        items.append("{}  —  по умолчанию".format(local / "Hoxmusicp"))
+        items.append("{}  —  Programs\\Hox".format(local / "Programs" / "Hox"))
+        for it in items:
+            if self.dir_combo.findText(it) < 0:
+                self.dir_combo.addItem(it)
+        self.dir_combo.setCurrentIndex(0)
+
+    def refresh_state(self) -> None:
+        base = find_install_base()
+        ver = read_player_version()
+        self._installed = bool(base and find_runtime() and find_player_script())
+        if self._installed:
+            self.status_label.setText(
+                "Плеер установлен: v{} — {}".format(ver or "?", base))
+        else:
+            self.status_label.setText(
+                "Плеер ещё не установлен — лаунчер сейчас проверит GitHub и скачает "
+                "его сам (нужен интернет). Кнопка «Установить Hox» ставит плеера "
+                "вручную из локальных файлов.")
+        self.btn_launch.setEnabled(self._installed and not self._busy)
+        self.btn_launch.setText("▶  Запустить плеер")
+        self.btn_open.setEnabled(self._installed and not self._busy)
+        self.btn_check.setEnabled(not self._busy)
+        if self._pending is not None:
+            self.btn_install.setText("Обновить до v{}".format(self._pending.get("version", "")))
+        elif self._installed:
+            self.btn_install.setText("Переустановить / восстановить")
+        else:
+            self.btn_install.setText("Установить Hox")
+        self.btn_install.setEnabled(not self._busy)
+        self.btn_browse.setEnabled(not self._busy)
+        self.dir_combo.setEnabled(not self._busy)
+        self.chk_desktop.setEnabled(not self._busy)
+        self.chk_startmenu.setEnabled(not self._busy)
+
+    def set_busy(self, on: bool) -> None:
+        self._busy = on
+        if on:
+            self.progress.setValue(0)
+        self.refresh_state()
+
+    # ---------- проверка обновлений ----------
+
+    def startup_check(self) -> None:
+        self.check_updates(auto=True)
+
+    def check_updates(self, checked: bool = False, auto: bool = False) -> None:
+        if self._busy:
+            return
+        repo = str(self.settings.value("updates/github_repo", "") or "").strip() or GITHUB_REPO.strip()
+        murl = str(self.settings.value("updates/manifest_url", "") or "").strip()
+        self._check_thread = CheckWorker(repo, murl)
+        self._check_thread.resolved.connect(
+            lambda d, a=auto: self.on_source_resolved(d, a))
+        self._check_thread.failed.connect(
+            lambda e, a=auto: self.on_check_failed(e, a))
+        # на время проверки запуск плеера заблокирован
+        self.btn_launch.setEnabled(False)
+        self.btn_launch.setText("Проверяю обновления…")
+        self.btn_open.setEnabled(False)
+        self.btn_check.setEnabled(False)
+        self.btn_install.setEnabled(False)
+        self.update_label.setText("Проверяю обновления…")
+        self.update_label.setStyleSheet("color: {};".format(MUTED))
+        self.log("Проверка обновлений: GitHub={} манифест={}".format(
+            repo or "—", murl or "—"))
+        self._check_thread.start()
+
+    def on_check_failed(self, err: str, auto: bool) -> None:
+        self.update_label.setText(
+            "Не удалось проверить обновления: {}. Проверка запустится при следующем "
+            "старте лаунчера или по кнопке.".format(err[:120]))
+        self.update_label.setStyleSheet("color: {};".format(WARN))
+        self.log("Проверка обновлений не удалась: " + err)
+        if not auto:
+            QMessageBox.warning(self, "Hox",
+                                "Не удалось проверить обновления:\n" + err)
+        self.refresh_state()
+
+    def on_source_resolved(self, src: Dict[str, Any], auto: bool) -> None:
+        local = read_player_version() or "0"
+        if src.get("kind") == "none":
+            self.update_label.setText(
+                "Источник обновлений не настроен — лаунчер работает автономно. "
+                "Укажите GitHub-репозиторий (launcher.ini → [updates] github_repo) "
+                "или URL манифеста, либо положите Hox-Player-*.zip рядом с лаунчером.")
+            self.update_label.setStyleSheet("color: {};".format(MUTED))
+            self.log("Источник обновлений не настроен")
+            if not auto:
+                QMessageBox.information(
+                    self, "Hox",
+                    "Источник обновлений не настроен.\n\n"
+                    "Варианты:\n"
+                    "1) launcher.ini → [updates] github_repo = владелец/репозиторий — "
+                    "обновления будут браться с GitHub Releases;\n"
+                    "2) launcher.ini → [updates] manifest_url = URL JSON-манифеста "
+                    "{version, url, sha256};\n"
+                    "3) автономно: положите Hox-Player-*.zip или установщик "
+                    "Hox-Setup.exe рядом с лаунчером.")
+            self.refresh_state()
+            return
+        remote = str(src.get("version", ""))
+        self.log("Источник: {} — v{}".format(src.get("source"), remote))
+        try:
+            has_update = parse_version(remote) > parse_version(local)
+        except Exception:
+            has_update = False
+        if has_update:
+            self._pending = dict(src)
+            self._downloaded = None
+            if not self._installed:
+                # плеера нет вообще — ставим автоматически, без вопросов (v3.0)
+                self._auto_launch_after = True
+                self.update_label.setText(
+                    "Плеер не найден — скачиваю и устанавливаю v{} ({})…".format(
+                        remote, src.get("source", "")))
+                self.update_label.setStyleSheet("color: {};".format(WARN))
+                self.news_box.setHtml(news_html(extra_head=release_notes_html(src)))
+                self.log("Плеер не установлен: автоустановка v{}".format(remote))
+                self.refresh_state()
+                self.start_update()
+                return
+            self.update_label.setText(
+                "Доступно обновление: v{} (у вас v{}) — источник: {}. "
+                "Нажмите «Обновить до v{}».".format(
+                    remote, local, src.get("source", ""), remote))
+            self.update_label.setStyleSheet("color: {};".format(WARN))
+            self.news_box.setHtml(news_html(extra_head=release_notes_html(src)))
+            self.refresh_state()
+            btn = QMessageBox.question(
+                self, "Обновление Hox",
+                "Доступна новая версия плеера: v{} (у вас v{}).\n\n"
+                "Скачать и установить сейчас?".format(remote, local),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if btn == QMessageBox.StandardButton.Yes:
+                self.start_update()
+        else:
+            self._pending = None
+            self.update_label.setText(
+                "У вас последняя версия: v{} (источник: {}).".format(
+                    local, src.get("source", "")))
+            self.update_label.setStyleSheet("color: {};".format(OK))
+            self.refresh_state()
+
+    # ---------- скачивание и установка ----------
+
+    def on_install_clicked(self) -> None:
+        if self._busy:
+            return
+        if self._pending is not None and self._downloaded is None:
+            self.start_update()
+            return
+        if self._downloaded is not None:
+            self.run_install(self._downloaded, "скачанный пакет", "player")
+            return
+        # офлайн-источники
+        pzip = find_local_player_zip()
+        if pzip is not None:
+            self.run_install(pzip, "архив плеера рядом с лаунчером", "player")
+            return
+        setup = find_local_setup()
+        if setup is not None:
+            self.run_install(setup, "установщик рядом с лаунчером")
+            return
+        full = find_local_payload_zip()
+        if full is not None:
+            self.run_install(full, "пейлоад рядом с лаунчером")
+            return
+        base = find_install_base()
+        if base is not None:
+            self.run_install(None, "собственная копия файлов")
+            return
+        QMessageBox.information(
+            self, "Hox",
+            "Нет источника установки.\n\n"
+            "Положите архив плеера Hox-Player-*.zip (или установщик "
+            "Hox-Setup.exe) рядом с лаунчером, настройте GitHub-репозиторий "
+            "в launcher.ini или скачайте архив плеера со страницы релизов.")
+
+    def start_update(self) -> None:
+        if self._pending is None or self._busy:
+            return
+        src = self._pending
+        url = str(src.get("url", "") or "")
+        if not url:
+            QMessageBox.warning(self, "Hox", "В источнике обновления нет ссылки на пакет.")
+            return
+        ver = str(src.get("version", "new"))
+        last = url.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+        if not last.lower().endswith((".zip", ".exe")):
+            last = "Hox-Player-" + ver + ".zip"
+        dest = Path(tempfile.gettempdir()) / ("Hox-download-" + ver + "-" + last)
+        self.set_busy(True)
+        self.progress.setValue(0)
+        self.status_label.setText("Скачиваю обновление v{}…".format(ver))
+        self.log("Скачивание: " + url)
+        self._download_thread = DownloadWorker(url, dest,
+                                               str(src.get("sha256", "") or ""))
+        self._download_thread.progress.connect(self.progress.setValue)
+        self._download_thread.stage.connect(self.status_label.setText)
+        self._download_thread.done_ok.connect(self.on_download_done)
+        self._download_thread.failed.connect(self.on_download_failed)
+        self._download_thread.start()
+
+    def on_download_done(self, path: str) -> None:
+        self._downloaded = Path(path)
+        self.log("Скачано: {} ({:.1f} МБ)".format(
+            path, self._downloaded.stat().st_size / 1048576.0))
+        self.run_install(self._downloaded, "скачанный пакет")
+
+    def on_download_failed(self, err: str) -> None:
+        self.set_busy(False)
+        self.status_label.setText("Скачивание не удалось.")
+        self.log("Скачивание не удалось: " + err)
+        QMessageBox.warning(self, "Hox", "Не удалось скачать обновление:\n" + err)
+
+    def run_install(self, path: Optional[Path], src_label: str,
+                    kind_hint: str = "") -> None:
+        if self._busy:
+            return
+        target = expand_dir(self.dir_combo.currentText())
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            probe = target / ".hox_write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(
+                self, "Hox",
+                "Нельзя писать в выбранную папку:\n{}\n\nОшибка: {}".format(target, e))
+            return
+        self.set_busy(True)
+        self.progress.setValue(0)
+        self.status_label.setText("Закрываю запущенный плеер…")
+        QApplication.processEvents()
+        if not close_player_processes():
+            self.set_busy(False)
+            QMessageBox.warning(
+                self, "Hox",
+                "Не удалось закрыть запущенный плеер.\nЗакройте Hox Music Player "
+                "вручную и повторите.")
+            return
+        desktop = self.chk_desktop.isChecked()
+        startmenu = self.chk_startmenu.isChecked()
+        if path is None:
+            kind = "selfcopy"
+            self._install_thread = InstallWorker(kind, target, desktop, startmenu)
+        elif path.suffix.lower() == ".exe":
+            kind = "setup"
+            self._install_thread = InstallWorker(kind, target, desktop, startmenu,
+                                                 setup_path=path)
+        elif kind_hint == "player" or path.name.lower().startswith("hox-player-"):
+            kind = "player"
+            self._install_thread = InstallWorker(kind, target, desktop, startmenu,
+                                                 zip_path=path)
+        else:
+            kind = "zip"
+            self._install_thread = InstallWorker(kind, target, desktop, startmenu,
+                                                 zip_path=path)
+        self.status_label.setText("Устанавливаю плеер из: {}".format(src_label))
+        self.log("Установка из {} в {}".format(src_label, target))
+        self._install_thread.stage.connect(self.status_label.setText)
+        self._install_thread.stage.connect(self.log)
+        self._install_thread.progress.connect(self.progress.setValue)
+        self._install_thread.done_ok.connect(self.on_install_done)
+        self._install_thread.failed.connect(self.on_install_failed)
+        self._install_thread.start()
+
+    def on_install_done(self, msg: str) -> None:
+        self.set_busy(False)
+        self.progress.setValue(100)
+        self.status_label.setText("Готово — " + msg.replace("\n", " "))
+        self.update_label.setText("Установка завершена. Приятного прослушивания!")
+        self.update_label.setStyleSheet("color: {};".format(OK))
+        self.log("Установка завершена: " + msg.replace("\n", " "))
+        self._fill_dir_combo()
+        self.refresh_state()
+        if self._auto_launch_after:
+            self._auto_launch_after = False
+            self.status_label.setText("Плеер установлен — запускаю…")
+            QTimer.singleShot(600, self.launch_player)
+
+    def on_install_failed(self, err: str) -> None:
+        self.set_busy(False)
+        self.progress.setValue(0)
+        self.status_label.setText("Установка не удалась: {}".format(err[:150]))
+        self.log("Установка не удалась: " + err)
+        QMessageBox.critical(self, "Hox", "Ошибка установки:\n" + err)
+
+    # ---------- запуск плеера ----------
+
+    def launch_player(self) -> None:
+        if self._busy:
+            return
+        rt = find_runtime()
+        ps = find_player_script()
+        if not (rt and ps):
+            QMessageBox.warning(self, "Hox", "Плеер не установлен.")
+            return
+        try:
+            kwargs = {}
+            if os.name == "nt":
+                kwargs["creationflags"] = CREATE_NO_WINDOW
+            subprocess.Popen([str(rt), str(ps)], cwd=str(ps.parent), **kwargs)
+            self.status_label.setText("Плеер запущен")
+            self.log("Плеер запущен: " + str(rt))
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Hox", "Не удалось запустить плеер:\n" + str(e))
+
+    # ---------- выбор папки ----------
+
+    def browse_dir(self) -> None:
+        start = expand_dir(self.dir_combo.currentText())
+        d = QFileDialog.getExistingDirectory(self, "Папка установки Hox", str(start))
+        if d:
+            self.dir_combo.insertItem(0, d)
+            self.dir_combo.setCurrentIndex(0)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        if self._busy and (self._download_thread and self._download_thread.isRunning()
+                           or self._install_thread and self._install_thread.isRunning()):
+            btn = QMessageBox.question(
+                self, "Hox",
+                "Идёт скачивание/установка. Прервать и закрыть лаунчер?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if btn != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        event.accept()
+
+
+def main():
+    os.environ.setdefault("QT_LOGGING_RULES", "*.debug=false")
+    app = QApplication(sys.argv)
+    app.setApplicationName("Hox Launcher")
+    app.setApplicationVersion(LAUNCHER_VERSION)
+    app.setWindowIcon(QIcon(draw_logo(64)))
+    win = LauncherWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

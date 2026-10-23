@@ -1,0 +1,8 @@
+* text=auto
+*.py text
+*.md text
+*.ini text
+*.sh text eol=lf
+*.png binary
+*.exe binary
+*.zip binary
