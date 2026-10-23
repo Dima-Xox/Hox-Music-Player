@@ -29,12 +29,13 @@ Hox Launcher v3.1 — проверка целостности + установк
   * запасной TLS-режим: если проверка сертификата не проходит (старые
     корневые сертификаты Windows 7), скачивание повторяется без неё;
   * перед обновлением сам закрывает запущенный плеер;
+  * пока плеер запущен, кнопки запуска неактивны (опрос player.lock, v0.4.4);
   * никаких консольных окон (CREATE_NO_WINDOW, pythonw.exe).
 
 Совместимость: PyQt6 на Win8.1/10/11 и fake-PyQt6 (PyQt5) на Win7 SP1
 (Python 3.8) — синтаксис ограничен 3.8, только scoped-энумы.
 
-Версия: 3.1 (релиз плеера 0.4.1)
+Версия: 3.4 (релиз плеера 0.4.4)
 """
 
 import os
@@ -53,7 +54,7 @@ import urllib.error
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, Tuple
 
-LAUNCHER_VERSION = "3.3"
+LAUNCHER_VERSION = "3.4"
 APP_TITLE = "Hox — Лаунчер"
 PLAYER_SCRIPT = "hox_music_player.py"
 # Манифест целостности: SHA-256 установленных файлов плеера; пишется при
@@ -74,6 +75,34 @@ GITHUB_REPO = "Dima-Xox/Hox-Music-Player"
 # Плеер запускается пропатченным Hox.exe (копия pythonw.exe с логотипом);
 # pythonw.exe оставлен как запасной вариант запуска
 PLAYER_EXE_NAMES = ("Hox.exe", "pythonw.exe")
+
+# v0.4.4 (лаунчер 3.4): пока плеер запущен, кнопки запуска неактивны.
+# Плеер пишет свой PID в player.lock при старте и убирает файл при выходе;
+# лаунчер опрашивает состояние таймером: свой Popen -> player.lock ->
+# периодический поиск процессов (PowerShell) — на случай старого плеера,
+# который ещё не пишет player.lock.
+PLAYER_LOCK_NAME = "player.lock"
+PLAYER_POLL_MS = 2000        # период опроса состояния плеера
+PS_SWEEP_SEC = 15.0          # период фоновой проверки процессов (PowerShell)
+# Однострочник: PID процессов плеера (в cmdline есть hox_music_player).
+# Get-CimInstance — Win8.1/10/11; на Win7 (PS 2.0, без CIM) — wmic.
+PS_PLAYER_PIDS_CMD = (
+    "$ErrorActionPreference='SilentlyContinue';"
+    "$out=@();"
+    "$cim=$false;"
+    "try{$cim=[bool](Get-Command Get-CimInstance -ErrorAction Stop)}catch{};"
+    "if($cim){"
+    "$out=@(Get-CimInstance Win32_Process|"
+    "Where-Object{$_.Name -imatch '^(python|hox)' "
+    "-and $_.CommandLine -imatch 'hox_music_player'}|"
+    "ForEach-Object{[string]$_.ProcessId})"
+    "}else{"
+    "$out=@(wmic process get ProcessId,CommandLine /format:csv|"
+    "ForEach-Object{if($_ -imatch 'hox_music_player' "
+    "-and $_ -imatch ',(\\d+)\\s*$'){$Matches[1]}})"
+    "};"
+    "$out"
+)
 
 # Ключ деинсталляции — общий с Hox-Setup.nsi (INSTKEY)
 UNINST_KEY = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Hoxmusicp"
@@ -105,6 +134,11 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # с GitHub показываются поверх этого списка)
 # ------------------------------------------------------------------
 NEWS: List[Tuple[str, List[str]]] = [
+    ("0.4.4", [
+        "Пока плеер запущен, кнопки «Запустить плеер» и «Открыть плеер» неактивны — случайный повторный запуск исключён; как только плеер закрыт, кнопки снова активны — лаунчер замечает это сам, без перезапуска.",
+        "Лаунчер видит плеера, запущенного откуда угодно: плеер при старте пишет свой PID в файл player.lock в папке установки и убирает его при выходе; для старых установок, где плеер ещё не пишет файл, работает резервная проверка процессов.",
+        "Если плеер был принудительно закрыт или упал, устаревший player.lock распознаётся по мёртвому PID и убирается автоматически — ложной блокировки кнопки не будет.",
+    ]),
     ("0.4.3", [
         "Исправлена ошибка v0.4.2: установка не запускалась после успешного скачивания архива плеера — лаунчер оставался в режиме «занят» с неактивными кнопками, а журнал обрывался на «Скачано».",
         "Теперь цепочка работает целиком: «Обновить / Переустановить» -> скачивание Hox-Player-*.zip -> проверка SHA-256 -> распаковка в app -> манифест целостности -> «Установка завершена».",
@@ -179,30 +213,46 @@ SHOTS: List[Tuple[str, str]] = [
 # Процессы плеера (закрытие перед обновлением) — из v1.7, проверено
 # ------------------------------------------------------------------
 def _player_pids() -> list:
-    """PID всех python/Hox-процессов, запущенных из каталога установки Hox.
+    """PID процессов плеера (в командной строке есть hox_music_player).
 
-    Ищем через PowerShell CIM по командной строке — надёжно работает даже
-    на свежих Windows 11, где wmic удалён.
+    PowerShell CIM — на Win8.1/10/11; на Win7 (PS 2.0, без Get-CimInstance)
+    — wmic. Фильтр по hox_music_player исключает процессы самого лаунчера
+    (Hox.exe с Hox-Launcher.pyw) — их нельзя ни закрывать, ни считать плеером.
     """
     if os.name != "nt":
         return []
     try:
-        ps_cmd = ("Get-CimInstance Win32_Process | Where-Object { $_.Name -imatch '^(python|hox)' "
-                  "-and $_.CommandLine -match 'Hoxmusicp|\\\\Hox\\\\' } | "
-                  "ForEach-Object { $_.ProcessId }")
         r = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-Command", PS_PLAYER_PIDS_CMD],
             capture_output=True, text=True, timeout=30,
             creationflags=CREATE_NO_WINDOW, check=False)
-        return [int(x) for x in r.stdout.split() if x.strip().isdigit()]
+        return _parse_pids_text(r.stdout)
     except Exception:
         return []
 
 
 def _pids_alive(pids: list) -> list:
     """Какие из PID ещё живы (через OpenProcess, без сторонних утилит)."""
-    if os.name != "nt" or not pids:
+    if not pids:
         return []
+    if os.name != "nt":
+        # POSIX (тестовый контур): os.kill(pid, 0) только проверяет живость
+        alive = []
+        for pid in pids:
+            pid = int(pid)
+            if pid <= 0:
+                continue
+            try:
+                os.kill(pid, 0)
+                alive.append(pid)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                alive.append(pid)
+            except OSError:
+                pass
+        return alive
     try:
         import ctypes
         alive = []
@@ -214,6 +264,31 @@ def _pids_alive(pids: list) -> list:
         return alive
     except Exception:
         return list(pids)  # не смогли проверить — считаем живыми
+
+
+def _parse_pids_text(text: str) -> List[int]:
+    """Целые PID из вывода PowerShell/wmic (по одному в строке/слове)."""
+    out: List[int] = []
+    for tok in (text or "").split():
+        t = tok.strip()
+        if t.isdigit():
+            v = int(t)
+            if 0 < v <= 4194304 and v not in out:  # максимум PID в Windows
+                out.append(v)
+    return out
+
+
+def lock_candidates() -> List[Path]:
+    """Где лаунчер ищет player.lock: рядом с установленным плеером и рядом
+    с самим лаунчером (в установленной копии это одна и та же папка app)."""
+    out: List[Path] = []
+    ps = find_player_script()
+    if ps is not None:
+        out.append(ps.parent / PLAYER_LOCK_NAME)
+    here = Path(__file__).resolve().parent / PLAYER_LOCK_NAME
+    if here not in out:
+        out.append(here)
+    return out
 
 
 def close_player_processes(timeout: float = 12.0) -> bool:
@@ -733,7 +808,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QGroupBox, QScrollArea, QTextEdit, QFrame, QDialog
 )
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QTimer, QSettings,
-                          QRect)
+                          QRect, QProcess)
 from PyQt6.QtGui import QPixmap, QPainter, QColor, QLinearGradient, QPen, QFont, QIcon
 
 
@@ -1371,6 +1446,12 @@ class LauncherWindow(QMainWindow):
         self._check_thread: Optional[QThread] = None
         self._download_thread: Optional[QThread] = None
         self._install_thread: Optional[QThread] = None
+        # v0.4.4 (лаунчер 3.4): отслеживание запущенного плеера
+        self._player_proc: Optional["subprocess.Popen"] = None
+        self._player_running = False
+        self._ps_pids: List[int] = []
+        self._ps_sweep_ts = 0.0
+        self._ps_proc: Optional[QProcess] = None
 
         central = QWidget()
         if self._scroll_overflow > 0:
@@ -1525,6 +1606,13 @@ class LauncherWindow(QMainWindow):
         self.log("Лаунчер v{} запущен (сборка плеера {})".format(
             LAUNCHER_VERSION, "Win7" if IS_WIN7_BUILD else "основная"))
         QTimer.singleShot(700, self.startup_check)
+        # v0.4.4: опрос состояния плеера — кнопки запуска активны,
+        # только пока плеер закрыт
+        self._player_timer = QTimer(self)
+        self._player_timer.setInterval(PLAYER_POLL_MS)
+        self._player_timer.timeout.connect(self._refresh_player_state)
+        self._player_timer.start()
+        self._ps_sweep_async()  # первый фоновый свип процессов плеера
 
     # ---------- скриншоты ----------
 
@@ -1621,9 +1709,14 @@ class LauncherWindow(QMainWindow):
         else:
             self.status_label.setText(
                 "Плеер установлен: v{} — {}".format(ver or "?", base))
-        self.btn_launch.setEnabled(self._installed and not self._busy)
-        self.btn_launch.setText("▶  Запустить плеер")
-        self.btn_open.setEnabled(self._installed and not self._busy)
+        running = bool(getattr(self, "_player_running", False))
+        act = self._installed and not self._busy and not running
+        self.btn_launch.setEnabled(act)
+        self.btn_launch.setText(
+            "●  Плеер запущен" if running else "▶  Запустить плеер")
+        self.btn_launch.setToolTip("Плеер уже запущен" if running else "")
+        self.btn_open.setEnabled(act)
+        self.btn_open.setToolTip("Плеер уже запущен" if running else "")
         self.btn_check.setEnabled(not self._busy)
         if self._pending is not None:
             self.btn_install.setText("⬇  Обновить до v{}".format(
@@ -1644,6 +1737,119 @@ class LauncherWindow(QMainWindow):
         self._busy = on
         if on:
             self.progress.setValue(0)
+        self.refresh_state()
+
+    # ---------- состояние плеера: запущен/закрыт (v0.4.4) ----------
+
+    def _check_in_flight(self) -> bool:
+        """Идёт ли сейчас проверка обновлений (её поток)."""
+        return self._check_thread is not None and self._check_thread.isRunning()
+
+    def _lock_pids(self) -> List[int]:
+        """PID из player.lock — файл пишет плеер при старте, убирает при выходе."""
+        pids: List[int] = []
+        for f in lock_candidates():
+            try:
+                if not f.is_file():
+                    continue
+                raw = f.read_text(encoding="ascii", errors="ignore").strip()
+                if not re.match(r"^\d{1,7}$", raw):
+                    continue
+                pid = int(raw)
+                if pid > 0 and pid not in pids:
+                    pids.append(pid)
+            except Exception:
+                continue
+        return pids
+
+    def _drop_dead_locks(self, dead: List[int]) -> None:
+        """Убрать player.lock с мёртвым PID (плеер упал или был убит)."""
+        dead_s = {str(p) for p in dead}
+        for f in lock_candidates():
+            try:
+                if f.is_file() and f.read_text(
+                        encoding="ascii", errors="ignore").strip() in dead_s:
+                    f.unlink()
+                    self.log("Убран устаревший player.lock (процесс плеера завершён)")
+            except Exception:
+                pass
+
+    def _quick_player_probe(self) -> bool:
+        """Быстрая проверка без PowerShell: player.lock + кэш свипа."""
+        known = self._lock_pids() + list(self._ps_pids)
+        known = [p for p in dict.fromkeys(known) if p != os.getpid()]
+        return bool(_pids_alive(known))
+
+    def _ps_sweep_async(self) -> None:
+        """Фоновый поиск процессов плеера через PowerShell (UI не блокируется).
+
+        Нужен для старых установок, где плеер ещё не пишет player.lock."""
+        if os.name != "nt" or self._ps_proc is not None:
+            return
+        try:
+            p = QProcess(self)
+            p.setProgram("powershell")
+            p.setArguments(["-NoProfile", "-ExecutionPolicy", "Bypass",
+                            "-Command", PS_PLAYER_PIDS_CMD])
+            p.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+            p.finished.connect(self._on_ps_sweep_finished)
+            self._ps_proc = p
+            p.start()
+        except Exception:
+            self._ps_proc = None
+
+    def _on_ps_sweep_finished(self, *args) -> None:  # noqa: ANN002
+        p, self._ps_proc = self._ps_proc, None
+        out = ""
+        if p is not None:
+            try:
+                out = bytes(p.readAllStandardOutput()).decode("utf-8", "ignore")
+            except Exception:
+                out = ""
+        self._ps_pids = [x for x in _parse_pids_text(out) if x != os.getpid()]
+        if not self._busy and not self._check_in_flight():
+            self._refresh_player_state()
+
+    def _refresh_player_state(self) -> None:
+        """Опрос состояния плеера (таймер PLAYER_POLL_MS):
+        свой Popen -> player.lock -> кэш PowerShell-свипа (+ новый свип)."""
+        if self._busy or self._check_in_flight():
+            return
+        running = False
+        proc = self._player_proc
+        if proc is not None:
+            if proc.poll() is None:
+                running = True
+            else:
+                self._player_proc = None
+        known = self._lock_pids() + list(self._ps_pids)
+        known = [p for p in dict.fromkeys(known) if p != os.getpid()]
+        alive = _pids_alive(known)
+        if alive:
+            running = True
+        alive_set = set(alive)
+        dead = [p for p in known if p not in alive_set]
+        if dead:
+            self._drop_dead_locks(dead)
+        self._ps_pids = [p for p in self._ps_pids if p in alive_set]
+        if not running:
+            now = time.monotonic()
+            if now - self._ps_sweep_ts >= PS_SWEEP_SEC:
+                self._ps_sweep_ts = now
+                self._ps_sweep_async()
+        self._apply_player_running(running)
+
+    def _apply_player_running(self, running: bool) -> None:
+        """Синхронизировать кнопки запуска с фактическим состоянием плеера."""
+        if running == self._player_running:
+            return
+        self._player_running = running
+        if self._busy or self._check_in_flight():
+            return  # кнопками управляет check_updates/refresh_state
+        if running:
+            self.log("Плеер запущен — кнопки запуска отключены")
+        else:
+            self.log("Плеер закрыт — запуск снова доступен")
         self.refresh_state()
 
     # ---------- проверка обновлений ----------
@@ -1893,6 +2099,10 @@ class LauncherWindow(QMainWindow):
                 "Не удалось закрыть запущенный плеер.\nЗакройте Hox Music Player "
                 "вручную и повторите.")
             return
+        # плеер закрыт — сбрасываем признак «запущен»; player.lock с мёртвым
+        # PID уберётся сам при следующем опросе (_drop_dead_locks)
+        self._player_proc = None
+        self._player_running = False
         desktop = self.chk_desktop.isChecked()
         startmenu = self.chk_startmenu.isChecked()
         if path is None:
@@ -1928,6 +2138,9 @@ class LauncherWindow(QMainWindow):
         self.update_label.setStyleSheet("color: {};".format(OK))
         self.log("Установка завершена: " + msg.replace("\n", " "))
         self._fill_dir_combo()
+        # после установки плеер закрыт — сброс состояния запуска
+        self._player_proc = None
+        self._player_running = False
         self.refresh_state()
 
     def on_install_failed(self, err: str) -> None:
@@ -1942,6 +2155,13 @@ class LauncherWindow(QMainWindow):
     def launch_player(self) -> None:
         if self._busy:
             return
+        proc = self._player_proc
+        if (proc is not None and proc.poll() is None) or self._player_running \
+                or self._quick_player_probe():
+            self._apply_player_running(True)
+            self.status_label.setText("Плеер уже запущен")
+            self.log("Плеер уже запущен — повторный запуск не требуется")
+            return
         rt = find_runtime()
         ps = find_player_script()
         if not (rt and ps):
@@ -1951,7 +2171,9 @@ class LauncherWindow(QMainWindow):
             kwargs = {}
             if os.name == "nt":
                 kwargs["creationflags"] = CREATE_NO_WINDOW
-            subprocess.Popen([str(rt), str(ps)], cwd=str(ps.parent), **kwargs)
+            self._player_proc = subprocess.Popen([str(rt), str(ps)],
+                                                 cwd=str(ps.parent), **kwargs)
+            self._apply_player_running(True)
             self.status_label.setText("Плеер запущен")
             self.log("Плеер запущен: " + str(rt))
         except Exception as e:  # noqa: BLE001
@@ -1967,6 +2189,11 @@ class LauncherWindow(QMainWindow):
             self.dir_combo.setCurrentIndex(0)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        if self._ps_proc is not None:
+            try:
+                self._ps_proc.kill()
+            except Exception:
+                pass
         if self._busy and (self._download_thread and self._download_thread.isRunning()
                            or self._install_thread and self._install_thread.isRunning()):
             btn = QMessageBox.question(

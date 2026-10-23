@@ -41,8 +41,47 @@ from mutagen.flac import FLAC
 from mutagen.mp4 import MP4
 
 APP_NAME = "Hox Music Player"
-APP_VERSION = "0.4.3"
+APP_VERSION = "0.4.4"
 APP_FULL_TITLE = f"{APP_NAME} v{APP_VERSION}"
+
+# v0.4.4: handshake с лаунчером. Плеер пишет свой PID в player.lock рядом
+# с собой (папка app установки), лаунчер читает этот файл и проверяет
+# живость PID — так кнопка «Запустить плеер» отключается, пока плеер
+# открыт. Если плеер упал, файл остаётся, но лаунчер считает PID мёртвым
+# и сам убирает мусор.
+PLAYER_LOCK_NAME = "player.lock"
+
+
+def _player_lock_path() -> Optional[Path]:
+    try:
+        return Path(__file__).resolve().parent / PLAYER_LOCK_NAME
+    except Exception:
+        return None
+
+
+def write_player_lock() -> None:
+    """Сообщить лаунчеру, что плеер запущен (PID в player.lock)."""
+    p = _player_lock_path()
+    if p is None:
+        return
+    try:
+        p.write_text(str(os.getpid()), encoding="ascii")
+    except Exception:
+        pass  # папка только для чтения — лаунчер увидит запуск через процесс
+
+
+def remove_player_lock() -> None:
+    """Убрать player.lock при выходе (только если PID в нём — наш)."""
+    p = _player_lock_path()
+    if p is None:
+        return
+    try:
+        if p.is_file() and p.read_text(
+                encoding="ascii", errors="ignore").strip() == str(os.getpid()):
+            p.unlink()
+    except Exception:
+        pass
+
 
 SUPPORTED_EXTENSIONS = {
     '.flac', '.wav', '.wave', '.mp3', '.ogg', '.m4a', '.aac', '.opus', '.wma', '.aiff'
@@ -1375,6 +1414,11 @@ def register_as_default_player(parent: QWidget):
 
 # --- Список изменений по версиям (для окна «Что нового») ---
 CHANGELOG: List[Tuple[str, List[str]]] = [
+    ("0.4.4", [
+        "Лаунчер 3.4: пока плеер запущен, кнопки «Запустить плеер» и «Открыть плеер» в лаунчере неактивны — повторный запуск невозможен; после закрытия плеера кнопки возвращаются сами, лаунчер видит это в реальном времени.",
+        "Плеер сообщает лаунчеру о своей работе: при старте пишет свой PID в файл player.lock рядом с собой и убирает файл при выходе — так лаунчер знает о плеере, запущенном и из ярлыка, а не только из окна лаунчера.",
+        "Если плеер был принудительно закрыт или упал, файл-признак остаётся, но лаунчер проверяет живость процесса и сам убирает устаревший файл — ложной блокировки кнопки не будет.",
+    ]),
     ("0.4.3", [
         "Лаунчер 3.3: исправлена ошибка v0.4.2, из-за которой установка не запускалась после успешного скачивания архива плеера — лаунчер оставался в режиме «занят» с неактивными кнопками, а журнал обрывался на строке «Скачано».",
         "Цепочка обновления теперь работает целиком: «Обновить / Переустановить» -> скачивание Hox-Player-*.zip -> проверка SHA-256 -> распаковка в папку app -> манифест целостности -> «Установка завершена».",
@@ -5579,6 +5623,8 @@ class MediaPlayerWindow(QMainWindow):
         self.raise_()
 
     def closeEvent(self, event):
+        # v0.4.4: убираем признак «плеер запущен» для лаунчера
+        remove_player_lock()
         # Запоминаем трек и позицию, чтобы продолжить песню при следующем запуске.
         # Путь берём из самого плеера (player.source), а не по индексу в списке:
         # после пересортировки/удаления файлов индекс может указывать не на тот трек,
@@ -6031,6 +6077,9 @@ def unregister_media_hotkeys(filt: Optional[MediaKeysFilter]) -> None:
 
 
 if __name__ == "__main__":
+    # v0.4.4: сразу сообщаем лаунчеру, что плеер запущен (до долгой
+    # инициализации Qt, чтобы опрос лаунчера увидел это как можно раньше)
+    write_player_lock()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
@@ -6062,6 +6111,8 @@ if __name__ == "__main__":
     _media_filter = register_media_hotkeys(_media_key_dispatch)
     app.aboutToQuit.connect(
         lambda: unregister_media_hotkeys(_media_filter))
+    # v0.4.4: страховка — убрать player.lock при любом способе выхода
+    app.aboutToQuit.connect(remove_player_lock)
 
     def _finish_startup():
         if window.should_start_in_mini():
