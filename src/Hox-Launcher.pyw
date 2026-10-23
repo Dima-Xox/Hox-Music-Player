@@ -1,15 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Hox Launcher v3.0 — менеджер плеера: сам ставит и обновляет плеер.
+Hox Launcher v3.1 — проверка целостности + установка строго по кнопке.
 
-Схема «лаунчер отдельно — плеер отдельно» (v0.4.0):
+Схема «лаунчер отдельно — плеер отдельно» (v0.4.0+, поведение v3.1):
   * установщик Hox-Setup-*.exe ставит ТОЛЬКО лаунчер (runtime Python +
     Hox-Launcher.pyw) и ярлык «Hox» на этот лаунчер;
-  * плеер (hox_music_player.py) лаунчер скачивает сам с GitHub Releases
-    отдельным архивом Hox-Player-<версия>.zip и распаковывает в папку app;
-  * при каждом запуске лаунчер проверяет релиз: если плеера нет — ставит
-    его автоматически; если установленная версия старее — предлагает
-    обновление в один клик;
+  * при каждом запуске лаунчер проверяет локальные файлы плеера
+    (целостность — SHA-256 по манифесту установки) и последнюю версию
+    на GitHub Releases;
+  * если файлы отсутствуют/повреждены или вышла новая версия — лаунчер
+    пишет «Требуется обновление» и ЖДЁТ: сам он ничего не скачивает,
+    установка начинается только по нажатию кнопки
+    «Обновить / Переустановить»;
+  * по кнопке качается архив плеера Hox-Player-<версия>.zip с GitHub
+    Releases (проверка SHA-256 до распаковки) и распаковывается
+    в папку app;
   * источники архива плеера (по приоритету):
       1) GitHub Releases (репозиторий: константа GITHUB_REPO ниже или
          [updates] github_repo в launcher.ini);
@@ -18,16 +23,18 @@ Hox Launcher v3.0 — менеджер плеера: сам ставит и об
       4) полный установщик Hox-Setup.exe рядом с лаунчером;
       5) zip-пейлоад рядом с лаунчером / собственная копия файлов;
   * проверка обновлений при запуске; на время проверки кнопка запуска
-    плеера заблокирована (как и просили);
+    плеера заблокирована, а кнопка установки остаётся активной;
   * новости о новых версиях + галерея скриншотов прямо в окне;
   * подпись «Ранняя бета»;
+  * запасной TLS-режим: если проверка сертификата не проходит (старые
+    корневые сертификаты Windows 7), скачивание повторяется без неё;
   * перед обновлением сам закрывает запущенный плеер;
   * никаких консольных окон (CREATE_NO_WINDOW, pythonw.exe).
 
 Совместимость: PyQt6 на Win8.1/10/11 и fake-PyQt6 (PyQt5) на Win7 SP1
 (Python 3.8) — синтаксис ограничен 3.8, только scoped-энумы.
 
-Версия: 3.0 (релиз плеера 0.4.0)
+Версия: 3.1 (релиз плеера 0.4.1)
 """
 
 import os
@@ -38,6 +45,7 @@ import time
 import hashlib
 import zipfile
 import shutil
+import ssl
 import tempfile
 import subprocess
 import urllib.request
@@ -45,9 +53,13 @@ import urllib.error
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, Tuple
 
-LAUNCHER_VERSION = "3.0"
+LAUNCHER_VERSION = "3.1"
 APP_TITLE = "Hox — Лаунчер"
 PLAYER_SCRIPT = "hox_music_player.py"
+# Манифест целостности: SHA-256 установленных файлов плеера; пишется при
+# установке (run_player_install), проверяется при каждом запуске —
+# см. player_integrity().
+MANIFEST_NAME = "player_files.json"
 # Win7-сборка (payload-win7) патчит эти две константы: маркер включается,
 # а локальная установка ищет Hox-Setup-Win7.exe рядом с лаунчером.
 IS_WIN7_BUILD = False
@@ -93,6 +105,12 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # с GitHub показываются поверх этого списка)
 # ------------------------------------------------------------------
 NEWS: List[Tuple[str, List[str]]] = [
+    ("0.4.1", [
+        "Лаунчер больше не скачивает плеер сам при запуске: при первом старте он проверяет наличие и целостность файлов и пишет «Требуется обновление» — скачивание и установка начинаются строго по нажатию кнопки «Обновить / Переустановить».",
+        "Проверка целостности при каждом запуске: SHA-256 каждого файла плеера сверяется с манифестом установки (player_files.json); отсутствующие или повреждённые файлы — снова «Требуется обновление», установка чинит их в один клик.",
+        "Кнопка «Обновить / Переустановить» всегда активна: один клик — скачивание лёгкого архива плеера Hox-Player-*.zip с GitHub Releases с прогресс-баром, проверкой SHA-256 и распаковкой в папку app.",
+        "Запасные режимы: без интернета кнопка поставит плеера из архива Hox-Player-*.zip рядом с лаунчером; на системах со старыми корневыми сертификатами (Windows 7) скачивание повторяется в запасном TLS-режиме.",
+    ]),
     ("0.4.0", [
         "Новая схема «лаунчер отдельно — плеер отдельно»: установщик ставит только лаунчер, а плеер лаунчер скачивает с GitHub сам — отдельным лёгким архивом Hox-Player-<версия>.zip.",
         "Если плеер ещё не установлен, лаунчер при запуске автоматически скачает и установит его, после чего плеер запускается одной кнопкой.",
@@ -304,6 +322,50 @@ def read_player_version() -> str:
         return ""
 
 
+def _read_version_of(path) -> str:
+    """APP_VERSION из конкретного файла (не из найденной установки)."""
+    try:
+        head = Path(path).read_text(encoding="utf-8", errors="ignore")[:4000]
+        m = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', head)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+def player_integrity() -> Tuple[bool, str]:
+    """Целостность установленных файлов плеера: (ok, деталь).
+
+    ok=False -> файлов нет или они повреждены; лаунчер показывает
+    «Требуется обновление», а установка по кнопке чинит это в один клик.
+    """
+    base = find_install_base()
+    if base is None:
+        return False, "плеер не установлен"
+    app_dir = Path(base) / "app"
+    if not (app_dir / PLAYER_SCRIPT).is_file():
+        return False, "не найден " + PLAYER_SCRIPT
+    mf = app_dir / MANIFEST_NAME
+    if not mf.is_file():
+        # установка от старого установщика (без манифеста) — наличие
+        # главного файла уже проверено выше
+        return True, ""
+    try:
+        data = json.loads(mf.read_text(encoding="utf-8"))
+    except Exception:
+        return False, "манифест установки не читается"
+    for name, hexdigest in (data.get("files") or {}).items():
+        f = app_dir / str(name)
+        if not f.is_file():
+            return False, "отсутствует файл " + str(name)
+        try:
+            h = hashlib.sha256(f.read_bytes()).hexdigest()
+        except Exception:
+            return False, "файл не читается: " + str(name)
+        if str(hexdigest).lower() != h:
+            return False, "не совпал SHA-256: " + str(name)
+    return True, ""
+
+
 def parse_version(v: str) -> tuple:
     """'0.3.10' -> (0, 3, 10); нечисловые части отбрасываются."""
     parts = []
@@ -388,6 +450,26 @@ def find_shot(name: str) -> Optional[Path]:
     return None
 
 
+def open_url(url, timeout: float = 30.0):
+    """urlopen с запасным TLS-режимом.
+
+    На старых системах (Windows 7 без обновлений корневых сертификатов)
+    проверка сертификата GitHub может не проходить — тогда запрос
+    повторяется с отключённой проверкой, чтобы обновление скачивалось
+    всё равно.
+    """
+    try:
+        return urllib.request.urlopen(url, timeout=timeout)
+    except urllib.error.URLError as e:
+        msg = str(getattr(e, "reason", e)).upper()
+        if "SSL" in msg or "CERTIFICATE" in msg:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            return urllib.request.urlopen(url, timeout=timeout, context=ctx)
+        raise
+
+
 # ------------------------------------------------------------------
 # GitHub Releases (архив плеера берётся с GitHub — актуальная версия)
 # ------------------------------------------------------------------
@@ -396,7 +478,7 @@ def github_latest(repo: str) -> Optional[Dict[str, Any]]:
     url = "https://api.github.com/repos/" + repo.strip() + "/releases/latest"
     req = urllib.request.Request(url, headers={"User-Agent": UA,
                                                "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with open_url(req, 15) as r:
         data = json.loads(r.read().decode("utf-8"))
     tag = str(data.get("tag_name", "") or "")
     version = tag.lstrip("vV")
@@ -439,7 +521,7 @@ def github_latest(repo: str) -> Optional[Dict[str, Any]]:
 def fetch_sha256(url: str) -> str:
     """Скачивает *.sha256 и возвращает hex-дайджест из содержимого."""
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with open_url(req, 15) as r:
         text = r.read(4096).decode("utf-8", errors="ignore")
     m = re.search(r"\b([0-9a-fA-F]{64})\b", text)
     return m.group(1).lower() if m else ""
@@ -476,7 +558,7 @@ def resolve_update_source(settings) -> Dict[str, Any]:
     if murl:
         try:
             req = urllib.request.Request(murl, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=20) as r:
+            with open_url(req, 20) as r:
                 data = json.loads(r.read().decode("utf-8"))
             if not isinstance(data, dict) or not data.get("url") or not data.get("version"):
                 raise ValueError("манифест без version/url")
@@ -685,38 +767,46 @@ class DownloadWorker(QThread):
         self.url, self.dest, self.sha256 = url, dest, sha256
 
     def run(self):
-        try:
-            req = urllib.request.Request(self.url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                total = int(resp.headers.get("Content-Length", 0) or 0)
-                done = 0
-                hasher = hashlib.sha256()
-                with open(self.dest, "wb") as f:
-                    while True:
-                        chunk = resp.read(256 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        hasher.update(chunk)
-                        done += len(chunk)
-                        if total:
-                            pct = int(done * 100 / total)
-                            self.progress.emit(pct)
-                            if pct % 5 == 0:
-                                self.stage.emit("Скачиваю: {:.1f} из {:.1f} МБ".format(
-                                    done / 1048576.0, total / 1048576.0))
-            if self.sha256:
-                got = hasher.hexdigest().lower()
-                if got != self.sha256.lower():
-                    raise ValueError("контрольная сумма не совпала ({}…)".format(got[:12]))
-            self.done_ok.emit(str(self.dest))
-        except Exception as e:  # noqa: BLE001
+        err = ""
+        for attempt in (1, 2):  # одна повторная попытка при сбое сети
             try:
-                if Path(self.dest).exists():
-                    Path(self.dest).unlink()
-            except Exception:
-                pass
-            self.failed.emit(str(e))
+                req = urllib.request.Request(self.url, headers={"User-Agent": UA})
+                with open_url(req, 30) as resp:
+                    total = int(resp.headers.get("Content-Length", 0) or 0)
+                    done = 0
+                    hasher = hashlib.sha256()
+                    with open(self.dest, "wb") as f:
+                        while True:
+                            chunk = resp.read(256 * 1024)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            hasher.update(chunk)
+                            done += len(chunk)
+                            if total:
+                                pct = int(done * 100 / total)
+                                self.progress.emit(pct)
+                                if pct % 5 == 0:
+                                    self.stage.emit(
+                                        "Скачиваю: {:.1f} из {:.1f} МБ".format(
+                                            done / 1048576.0, total / 1048576.0))
+                if self.sha256:
+                    got = hasher.hexdigest().lower()
+                    if got != self.sha256.lower():
+                        raise ValueError(
+                            "контрольная сумма не совпала ({}…)".format(got[:12]))
+                self.done_ok.emit(str(self.dest))
+                return
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
+                try:
+                    if Path(self.dest).exists():
+                        Path(self.dest).unlink()
+                except Exception:
+                    pass
+                if attempt == 1:
+                    time.sleep(1.0)  # короткая пауза и повтор
+        self.failed.emit(err)
 
 
 def _zip_contains_installer(zf: zipfile.ZipFile) -> bool:
@@ -883,24 +973,47 @@ class InstallWorker(QThread):
             if not any(rel.lower() == PLAYER_SCRIPT for _, rel in safe):
                 raise ValueError("в архиве нет " + PLAYER_SCRIPT)
             n = len(safe)
-            skipped = 0
+            skipped: List[str] = []
+            written: List[str] = []
             for i, (info, rel) in enumerate(safe):
                 dest = app_dir / rel
                 try:
                     with zf.open(info) as srcf, open(dest, "wb") as dstf:
                         shutil.copyfileobj(srcf, dstf)
+                    written.append(rel)
                 except PermissionError:
-                    skipped += 1  # файл занят — не мешает остальным
+                    skipped.append(rel)  # файл занят — не мешает остальным
                 except OSError as e:
                     if getattr(e, "winerror", None) in (5, 32):
-                        skipped += 1
+                        skipped.append(rel)
                     else:
                         raise
                 self.progress.emit(int((i + 1) * 100 / max(1, n)))
             self.log("Файлов плеера установлено: {}{}".format(
-                n - skipped,
-                ", пропущено занятых: {}".format(skipped) if skipped else ""))
-        ver = read_player_version()
+                len(written),
+                ", пропущено занятых: {}".format(len(skipped)) if skipped else ""))
+            # манифест целостности: SHA-256 каждого установленного файла —
+            # по нему каждый запуск лаунчера проверяет, что файлы на месте
+            # и не повреждены (иначе — «Требуется обновление»)
+            ver = _read_version_of(app_dir / PLAYER_SCRIPT)
+            manifest = {"version": ver or "",
+                        "installed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "files": {}}
+            for rel in written:
+                try:
+                    manifest["files"][rel] = hashlib.sha256(
+                        (app_dir / rel).read_bytes()).hexdigest()
+                except Exception:
+                    pass
+            try:
+                (app_dir / MANIFEST_NAME).write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=1),
+                    encoding="utf-8")
+                self.log("Манифест целостности записан ({} файлов)".format(
+                    len(manifest["files"])))
+            except Exception as e:  # noqa: BLE001
+                self.log("Манифест целостности не записан: " + str(e))
+        ver = _read_version_of(app_dir / PLAYER_SCRIPT) or read_player_version()
         self.done_ok.emit("Плеер установлен: v{}\nПапка: {}".format(
             ver or "?", app_dir))
 
@@ -1190,7 +1303,8 @@ class LauncherWindow(QMainWindow):
                                   QSettings.Format.IniFormat)
         self._busy = False
         self._installed = False
-        self._auto_launch_after = False
+        self._integrity_ok = True
+        self._install_after_check = False
         self._pending: Optional[Dict[str, Any]] = None
         self._downloaded: Optional[Path] = None
         self._check_thread: Optional[QThread] = None
@@ -1414,25 +1528,35 @@ class LauncherWindow(QMainWindow):
     def refresh_state(self) -> None:
         base = find_install_base()
         ver = read_player_version()
-        self._installed = bool(base and find_runtime() and find_player_script())
-        if self._installed:
+        ok, detail = player_integrity()
+        self._integrity_ok = ok
+        self._installed = bool(base and find_runtime() and find_player_script() and ok)
+        if not base or not find_player_script():
             self.status_label.setText(
-                "Плеер установлен: v{} — {}".format(ver or "?", base))
+                "Требуется обновление: плеер не установлен. Нажмите "
+                "«Обновить / Переустановить» — лаунчер скачает архив плеера "
+                "с GitHub и установит его (нужен интернет).")
+        elif not ok:
+            self.status_label.setText(
+                "Требуется обновление: файлы плеера отсутствуют или повреждены "
+                "({}). Нажмите «Обновить / Переустановить» для восстановления."
+                .format(detail))
         else:
             self.status_label.setText(
-                "Плеер ещё не установлен — лаунчер сейчас проверит GitHub и скачает "
-                "его сам (нужен интернет). Кнопка «Установить Hox» ставит плеера "
-                "вручную из локальных файлов.")
+                "Плеер установлен: v{} — {}".format(ver or "?", base))
         self.btn_launch.setEnabled(self._installed and not self._busy)
         self.btn_launch.setText("▶  Запустить плеер")
         self.btn_open.setEnabled(self._installed and not self._busy)
         self.btn_check.setEnabled(not self._busy)
         if self._pending is not None:
-            self.btn_install.setText("Обновить до v{}".format(self._pending.get("version", "")))
-        elif self._installed:
-            self.btn_install.setText("Переустановить / восстановить")
+            self.btn_install.setText("⬇  Обновить до v{}".format(
+                self._pending.get("version", "")))
+        elif not self._installed:
+            self.btn_install.setText("⬇  Обновить / Переустановить")
         else:
-            self.btn_install.setText("Установить Hox")
+            self.btn_install.setText("Переустановить / восстановить")
+        # кнопка установки всегда активна (кроме занятого состояния) —
+        # скачивание начинается только по нажатию, без авто-скачиваний
         self.btn_install.setEnabled(not self._busy)
         self.btn_browse.setEnabled(not self._busy)
         self.dir_combo.setEnabled(not self._busy)
@@ -1460,12 +1584,14 @@ class LauncherWindow(QMainWindow):
             lambda d, a=auto: self.on_source_resolved(d, a))
         self._check_thread.failed.connect(
             lambda e, a=auto: self.on_check_failed(e, a))
-        # на время проверки запуск плеера заблокирован
+        # на время проверки запуск плеера заблокирован; кнопка установки
+        # остаётся активной — если проверка затянется, установку можно
+        # запросить сразу (она выполнится после ответа GitHub)
         self.btn_launch.setEnabled(False)
         self.btn_launch.setText("Проверяю обновления…")
         self.btn_open.setEnabled(False)
         self.btn_check.setEnabled(False)
-        self.btn_install.setEnabled(False)
+        self.btn_install.setEnabled(True)
         self.update_label.setText("Проверяю обновления…")
         self.update_label.setStyleSheet("color: {};".format(MUTED))
         self.log("Проверка обновлений: GitHub={} манифест={}".format(
@@ -1473,26 +1599,46 @@ class LauncherWindow(QMainWindow):
         self._check_thread.start()
 
     def on_check_failed(self, err: str, auto: bool) -> None:
-        self.update_label.setText(
-            "Не удалось проверить обновления: {}. Проверка запустится при следующем "
-            "старте лаунчера или по кнопке.".format(err[:120]))
-        self.update_label.setStyleSheet("color: {};".format(WARN))
+        need_install = self._install_after_check
+        self._install_after_check = False
+        ok, detail = player_integrity()
+        if ok:
+            self.update_label.setText(
+                "Не удалось проверить обновления: {}. Проверка запустится при "
+                "следующем старте лаунчера или по кнопке.".format(err[:120]))
+        else:
+            self.update_label.setText(
+                "ТРЕБУЕТСЯ ОБНОВЛЕНИЕ ({}), но источник сейчас недоступен: {}. "
+                "Нажмите кнопку ещё раз или положите Hox-Player-*.zip рядом "
+                "с лаунчером.".format(detail, err[:100]))
+        self.update_label.setStyleSheet(
+            "color: {}; font-weight: bold;".format(WARN))
         self.log("Проверка обновлений не удалась: " + err)
-        if not auto:
+        if need_install:
+            QMessageBox.warning(
+                self, "Hox",
+                "Не удалось получить источник установки:\n" + err[:200] +
+                "\n\nПроверьте интернет и нажмите кнопку установки ещё раз, "
+                "либо положите архив плеера Hox-Player-*.zip рядом с лаунчером.")
+        elif not auto:
             QMessageBox.warning(self, "Hox",
                                 "Не удалось проверить обновления:\n" + err)
         self.refresh_state()
 
     def on_source_resolved(self, src: Dict[str, Any], auto: bool) -> None:
+        ok, detail = player_integrity()
         local = read_player_version() or "0"
+        click_install = self._install_after_check
+        self._install_after_check = False
         if src.get("kind") == "none":
+            self._pending = None
             self.update_label.setText(
                 "Источник обновлений не настроен — лаунчер работает автономно. "
                 "Укажите GitHub-репозиторий (launcher.ini → [updates] github_repo) "
                 "или URL манифеста, либо положите Hox-Player-*.zip рядом с лаунчером.")
             self.update_label.setStyleSheet("color: {};".format(MUTED))
             self.log("Источник обновлений не настроен")
-            if not auto:
+            if click_install:
                 QMessageBox.information(
                     self, "Hox",
                     "Источник обновлений не настроен.\n\n"
@@ -1511,42 +1657,48 @@ class LauncherWindow(QMainWindow):
             has_update = parse_version(remote) > parse_version(local)
         except Exception:
             has_update = False
-        if has_update:
+        if click_install:
+            # пользователь нажал «Обновить / Переустановить» — качаем и ставим
             self._pending = dict(src)
             self._downloaded = None
-            if not self._installed:
-                # плеера нет вообще — ставим автоматически, без вопросов (v3.0)
-                self._auto_launch_after = True
-                self.update_label.setText(
-                    "Плеер не найден — скачиваю и устанавливаю v{} ({})…".format(
-                        remote, src.get("source", "")))
-                self.update_label.setStyleSheet("color: {};".format(WARN))
-                self.news_box.setHtml(news_html(extra_head=release_notes_html(src)))
-                self.log("Плеер не установлен: автоустановка v{}".format(remote))
-                self.refresh_state()
-                self.start_update()
-                return
-            self.update_label.setText(
-                "Доступно обновление: v{} (у вас v{}) — источник: {}. "
-                "Нажмите «Обновить до v{}».".format(
-                    remote, local, src.get("source", ""), remote))
-            self.update_label.setStyleSheet("color: {};".format(WARN))
             self.news_box.setHtml(news_html(extra_head=release_notes_html(src)))
+            self.log("Установка по кнопке: скачиваю v{}".format(remote))
             self.refresh_state()
-            btn = QMessageBox.question(
-                self, "Обновление Hox",
-                "Доступна новая версия плеера: v{} (у вас v{}).\n\n"
-                "Скачать и установить сейчас?".format(remote, local),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if btn == QMessageBox.StandardButton.Yes:
-                self.start_update()
-        else:
-            self._pending = None
+            self.start_update()
+            return
+        if not ok:
+            # файлы плеера отсутствуют или повреждены — статус и ЖДЁМ нажатия
+            self._pending = dict(src)
+            self._downloaded = None
             self.update_label.setText(
-                "У вас последняя версия: v{} (источник: {}).".format(
-                    local, src.get("source", "")))
-            self.update_label.setStyleSheet("color: {};".format(OK))
+                "ТРЕБУЕТСЯ ОБНОВЛЕНИЕ ({}). Нажмите «Обновить / Переустановить», "
+                "чтобы скачать и установить v{} ({}).".format(
+                    detail, remote, src.get("source", "")))
+            self.update_label.setStyleSheet(
+                "color: {}; font-weight: bold;".format(WARN))
+            self.news_box.setHtml(news_html(extra_head=release_notes_html(src)))
+            self.log("Требуется обновление: {}".format(detail))
             self.refresh_state()
+            return
+        if has_update:
+            # вышла новая версия — статус и ждём нажатия кнопки (без диалогов)
+            self._pending = dict(src)
+            self._downloaded = None
+            self.update_label.setText(
+                "ТРЕБУЕТСЯ ОБНОВЛЕНИЕ: доступна версия v{} (у вас v{}) — "
+                "нажмите «Обновить до v{}».".format(remote, local, remote))
+            self.update_label.setStyleSheet(
+                "color: {}; font-weight: bold;".format(WARN))
+            self.news_box.setHtml(news_html(extra_head=release_notes_html(src)))
+            self.log("Доступно обновление: v{} -> v{}".format(local, remote))
+            self.refresh_state()
+            return
+        self._pending = None
+        self.update_label.setText(
+            "У вас последняя версия: v{} (источник: {}). Файлы проверены — целы.".
+            format(local, src.get("source", "")))
+        self.update_label.setStyleSheet("color: {};".format(OK))
+        self.refresh_state()
 
     # ---------- скачивание и установка ----------
 
@@ -1559,7 +1711,7 @@ class LauncherWindow(QMainWindow):
         if self._downloaded is not None:
             self.run_install(self._downloaded, "скачанный пакет", "player")
             return
-        # офлайн-источники
+        # офлайн-источники (без интернета)
         pzip = find_local_player_zip()
         if pzip is not None:
             self.run_install(pzip, "архив плеера рядом с лаунчером", "player")
@@ -1572,16 +1724,18 @@ class LauncherWindow(QMainWindow):
         if full is not None:
             self.run_install(full, "пейлоад рядом с лаунчером")
             return
-        base = find_install_base()
-        if base is not None:
-            self.run_install(None, "собственная копия файлов")
+        # локальных источников нет — качаем с GitHub (если проверка ещё
+        # не сделана, сначала спрашиваем GitHub, потом сразу ставим)
+        self._install_after_check = True
+        if self._check_thread is not None and self._check_thread.isRunning():
+            self.update_label.setText(
+                "Ищу источник установки — идёт проверка GitHub…")
+            self.update_label.setStyleSheet("color: {};".format(MUTED))
+            self.log("Кнопка установки нажата во время проверки — "
+                     "установлю сразу после ответа GitHub")
             return
-        QMessageBox.information(
-            self, "Hox",
-            "Нет источника установки.\n\n"
-            "Положите архив плеера Hox-Player-*.zip (или установщик "
-            "Hox-Setup.exe) рядом с лаунчером, настройте GitHub-репозиторий "
-            "в launcher.ini или скачайте архив плеера со страницы релизов.")
+        self.log("Локальных источников нет — запрашиваю GitHub")
+        self.check_updates()
 
     def start_update(self) -> None:
         if self._pending is None or self._busy:
@@ -1676,15 +1830,12 @@ class LauncherWindow(QMainWindow):
         self.set_busy(False)
         self.progress.setValue(100)
         self.status_label.setText("Готово — " + msg.replace("\n", " "))
-        self.update_label.setText("Установка завершена. Приятного прослушивания!")
+        self.update_label.setText(
+            "Установка завершена. Файлы на месте — нажмите «Запустить плеер».")
         self.update_label.setStyleSheet("color: {};".format(OK))
         self.log("Установка завершена: " + msg.replace("\n", " "))
         self._fill_dir_combo()
         self.refresh_state()
-        if self._auto_launch_after:
-            self._auto_launch_after = False
-            self.status_label.setText("Плеер установлен — запускаю…")
-            QTimer.singleShot(600, self.launch_player)
 
     def on_install_failed(self, err: str) -> None:
         self.set_busy(False)
