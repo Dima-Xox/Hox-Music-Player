@@ -41,7 +41,7 @@ from mutagen.flac import FLAC
 from mutagen.mp4 import MP4
 
 APP_NAME = "Hox Music Player"
-APP_VERSION = "0.4.7"
+APP_VERSION = "0.4.8"
 APP_FULL_TITLE = f"{APP_NAME} v{APP_VERSION}"
 
 # v0.4.4: handshake с лаунчером. Плеер пишет свой PID в player.lock рядом
@@ -598,7 +598,10 @@ def read_metadata(filepath: Path, folder_index: int = 0) -> TrackInfo:
     display_num = leading_num if leading_num is not None else (
         track_num if track_num != 999999 else folder_index
     )
-    num_str = str(display_num) if display_num and display_num != 999999 else "-"
+    # v0.4.8-фикс: сравнение через is not None — номер «0» (файлы вида
+    # «00 - Track.mp3» или тег tracknumber=0) раньше превращался в «-»
+    num_str = str(display_num) if (display_num is not None
+                                   and display_num != 999999) else "-"
 
     date_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M") if mtime else "-"
     mins, secs = divmod(int(duration_sec), 60)
@@ -1414,6 +1417,13 @@ def register_as_default_player(parent: QWidget):
 
 # --- Список изменений по версиям (для окна «Что нового») ---
 CHANGELOG: List[Tuple[str, List[str]]] = [
+    ("0.4.8", [
+        "Порядок альбомов исправлен: «Воспроизвести альбом» и «Играть все треки исполнителя» теперь играют треки в порядке самого альбома (альбомы подряд, затем остальная библиотека) — раньше игралcя только первый трек, а «Следующий» шёл по порядку общего списка.",
+        "Клик по строке караоке учитывает ручной сдвиг синхронизации текста: перемотка по клику теперь точная — как в мини-плеере.",
+        "Кнопка «Предыдущий трек» до выбора трека больше не перескакивает на предпоследний: включает последний трек списка, как и ожидалось.",
+        "Номер трека «0» (файлы вида «00 - …», тег tracknumber=0) больше не показывается как прочерк.",
+        "Подсветка играющего трека больше не сбрасывается после сканирования папок, если часть треков исчезла из системы — играющий трек остаётся выделенным и продолжает играть.",
+    ]),
     ("0.4.7", [
         "Лаунчер 3.7 встречает вас загрузочным экраном: логотип и проверка обновлений прямо на загрузочном экране — результат виден ещё до открытия главного окна, ничего нажимать не нужно.",
         "Список изменений до обновления: если вышла новая версия, загрузочный экран сразу покажет заметки релиза с GitHub — можно прочитать, что нового, и обновиться одной кнопкой.",
@@ -3125,20 +3135,36 @@ class ArtistsAlbumsView(QWidget):
         self.main_win.play_by_filepath(fpath)
 
     def _play_track_subset(self, subset: List[TrackInfo]):
-        if subset:
-            self.main_win.play_by_filepath(subset[0].filepath)
+        """Играет выбранный набор треков (альбом) В ЕГО СОБСТВЕННОМ порядке.
+
+        v0.4.8-фикс: раньше игрался только первый трек, а дальше «Следующий»
+        шёл по порядку общего плейлиста — порядок альбома не соблюдался.
+        Теперь плейлист перестраивается: сначала треки альбома (в порядке
+        альбома), затем остальные треки библиотеки — ни один трек не теряется.
+        """
+        if not subset:
+            return
+        subset_paths = {t.filepath for t in subset}
+        rest = [t for t in self.main_win.tracks if t.filepath not in subset_paths]
+        self.main_win.playlist_model.update_tracks(list(subset) + rest)
+        self.main_win.play_index(0)
 
     def _play_all_artist_tracks(self):
+        """«Играть все треки исполнителя»: все альбомы подряд (v0.4.8-фикс).
+
+        Раньше цикл по альбомам обрывался после первого же трека (break) и
+        реально играл только одну песню. Теперь собираем все треки
+        исполнителя в порядке альбомов и передаём в _play_track_subset.
+        """
         current = self.artist_list.currentItem()
         if not current:
             return
         artist_name = current.data(Qt.ItemDataRole.UserRole)
         alb_dict = self.artists_map.get(artist_name, {})
+        all_tracks: List[TrackInfo] = []
         for album_name in sorted(alb_dict.keys(), key=natural_sort_key):
-            tracks = alb_dict[album_name]
-            if tracks:
-                self.main_win.play_by_filepath(tracks[0].filepath)
-                break
+            all_tracks.extend(alb_dict[album_name])
+        self._play_track_subset(all_tracks)
 
 
 class KaraokeLyricsWidget(QWidget):
@@ -3396,7 +3422,11 @@ class KaraokeLyricsWidget(QWidget):
         r = int(pt.y() // slot_h) if slot_h > 0 else 1
         i = center - 1 + r
         if 0 <= i < len(self.lines):
-            self.window().player.setPosition(int(self.lines[i].time_ms))
+            # v0.4.8-фикс: учитываем ручной сдвиг синхронизации — раньше клик
+            # ставил «голое» время строки, и при сдвиге текста активной сразу
+            # становилась другая строка (миниплеер считал сдвиг, караоке — нет)
+            off = int(getattr(self.window(), "lyric_offset_ms", 0))
+            self.window().player.setPosition(max(0, int(self.lines[i].time_ms) + off))
 
     def _build_text_menu(self) -> QMenu:
         """Меню текста песни (v0.3.6): бывшие кнопки убранной вкладки —
@@ -5421,6 +5451,16 @@ class MediaPlayerWindow(QMainWindow):
             self.playlist_model.update_tracks(new_tracks_list)
             self.apply_sorting()
             self.artists_view.rebuild_catalog(self.tracks)
+            # v0.4.8-фикс: после удаления индексы сдвинулись — привязываем
+            # current_index к реально играющему треку (если он ещё в списке),
+            # иначе prev/next отсчитывали шаги от «мёртвого» индекса
+            playing_fp = self.playlist_model.playing_filepath
+            self.current_index = -1
+            if playing_fp is not None:
+                for idx, t in enumerate(self.tracks):
+                    if t.filepath == playing_fp:
+                        self.current_index = idx
+                        break
 
         new_files = sorted(current_disk_files - self.known_paths)
         if new_files:
@@ -5892,7 +5932,11 @@ class MediaPlayerWindow(QMainWindow):
     def prev_track(self):
         if not self.tracks:
             return
-        new_idx = (self.current_index - 1) % len(self.tracks)
+        # v0.4.8-фикс: при ещё не выбранном треке (current_index = -1) формула
+        # (-1 - 1) % N прыгала на ПРЕДпоследний трек; считаем от нуля —
+        # получаем последний трек плейлиста, как и ожидает переход «назад»
+        start = self.current_index if self.current_index >= 0 else 0
+        new_idx = (start - 1) % len(self.tracks)
         self.play_index(new_idx)
 
     def next_track(self):

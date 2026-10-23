@@ -73,10 +73,10 @@ github_repo = владелец/hox-music-player
 ## Проверка контрольных сумм (Windows)
 
 ```bat
-certutil -hashfile Hox-Player-0.4.7.zip SHA256
+certutil -hashfile Hox-Player-0.4.8.zip SHA256
 ```
 
-Сравните результат с содержимым `Hox-Player-0.4.7.zip.sha256` из релиза (для установщиков — аналогично).
+Сравните результат с содержимым `Hox-Player-0.4.8.zip.sha256` из релиза (для установщиков — аналогично).
 
 ## Исходники
 
