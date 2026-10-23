@@ -579,12 +579,12 @@ void MainWindow::probeStatus(QMediaPlayer::MediaStatus st)
         const QMediaMetaData md = m_probe->metaData();
         const QString mTitle = md.stringValue(QMediaMetaData::Title);
         // В Qt6 нет ключа «Artist» — исполнитель живёт в AlbumArtist /
-        // LeadPerformer / Contributor (зависит от формата и бэкенда).
+        // LeadPerformer / ContributingArtist (зависит от формата и бэкенда).
         QString mArtist = md.stringValue(QMediaMetaData::AlbumArtist);
         if (mArtist.isEmpty())
             mArtist = md.stringValue(QMediaMetaData::LeadPerformer);
         if (mArtist.isEmpty())
-            mArtist = md.stringValue(QMediaMetaData::Contributor);
+            mArtist = md.stringValue(QMediaMetaData::ContributingArtist);
         const QString mAlbum = md.stringValue(QMediaMetaData::AlbumTitle);
         if (!mTitle.isEmpty())
             t.title = mTitle;
