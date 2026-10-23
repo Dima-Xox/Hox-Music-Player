@@ -34,6 +34,13 @@ Hox Launcher v3.5 — проверка целостности + установк
     скачивает установщик Hox-Setup-<версия>.exe (проверка SHA-256),
     запускает его тихо (/S) — установщик заменит файлы и перезапустит
     лаунчер сам; после него обновляется и плеер;
+  * v0.4.7: загрузочный экран — лаунчер встречает пользователя сплэшем
+    с логотипом и проверяет обновления прямо на нём; если вышла новая
+    версия, на загрузочном экране показывается список изменений
+    (заметки релиза с GitHub) и кнопки «Обновить» / «Пропустить»;
+    после самообновления лаунчера новый экземпляр по маркеру
+    launcher_updated.json показывает «Обновление завершено» со
+    списком изменений установленной версии;
   * пока плеер запущен, кнопки запуска неактивны (опрос player.lock, v0.4.4);
   * v0.4.5: пока плеер запущен, окно лаунчера сворачивается в трей,
     при закрытии плеера — разворачивается обратно; крестик оставляет
@@ -44,7 +51,7 @@ Hox Launcher v3.5 — проверка целостности + установк
 Совместимость: PyQt6 на Win8.1/10/11 и fake-PyQt6 (PyQt5) на Win7 SP1
 (Python 3.8) — синтаксис ограничен 3.8, только scoped-энумы.
 
-Версия: 3.6 (релиз плеера 0.4.6)
+Версия: 3.7 (релиз плеера 0.4.7)
 """
 
 import os
@@ -64,13 +71,13 @@ import urllib.error
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, Tuple
 
-LAUNCHER_VERSION = "3.6"
+LAUNCHER_VERSION = "3.7"
 # Релиз, которому соответствует эта сборка лаунчера (версии плеера и
 # лаунчера выпускаются вместе). Если в GitHub Releases появился релиз
 # новее, лаунчер предлагает обновить сам себя: скачивает установщик
 # Hox-Setup-<версия>.exe (для Win7-сборки — Hox-Setup-Win7-*.exe)
 # и запускает его тихо — тот заменяет файлы и перезапускает лаунчер.
-RELEASE_VERSION = "0.4.6"
+RELEASE_VERSION = "0.4.7"
 APP_TITLE = "Hox — Лаунчер"
 PLAYER_SCRIPT = "hox_music_player.py"
 # Манифест целостности: SHA-256 установленных файлов плеера; пишется при
@@ -112,6 +119,17 @@ SINGLE_PORTS = (46121, 46122, 46123)  # TCP на 127.0.0.1: «уже запущ�
 # v0.4.6 (лаунчер 3.6): файл лаунчера в payload — по нему установщик
 # подтверждает успешное самообновление лаунчера.
 LAUNCHER_FILE = "Hox-Launcher.pyw"
+# v0.4.7 (лаунчер 3.7): маркер самообновления — перед тихой установкой
+# нового лаунчера текущий экземпляр пишет «обновляюсь до <версия>»;
+# новый экземпляр по этому маркеру показывает на загрузочном экране
+# «Обновление завершено» со списком изменений установленной версии.
+# Если обновление не состоялось, маркер удаляется как устаревший
+# (версия в нём не совпала с версией запустившейся сборки).
+UPDATED_MARKER = "launcher_updated.json"
+# Загрузочный экран: минимальное время показа (чтобы не мигал) и время
+# авто-закрытия экрана «Обновление завершено», мс.
+SPLASH_MIN_SHOW_MS = 1200
+SPLASH_DONE_AUTOCLOSE_MS = 10000
 # Однострочник: PID процессов плеера (в cmdline есть hox_music_player).
 # Get-CimInstance — Win8.1/10/11; на Win7 (PS 2.0, без CIM) — wmic.
 PS_PLAYER_PIDS_CMD = (
@@ -162,6 +180,11 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # с GitHub показываются поверх этого списка)
 # ------------------------------------------------------------------
 NEWS: List[Tuple[str, List[str]]] = [
+    ("0.4.7", [
+        "Лаунчер встречает вас загрузочным экраном: логотип, проверка обновлений прямо на загрузочном экране и результат ещё до открытия главного окна — ничего нажимать не нужно.",
+        "Список изменений до обновления: если вышла новая версия, загрузочный экран сразу покажет заметки релиза с GitHub — можно прочитать, что нового, и обновиться одной кнопкой или продолжить без обновления.",
+        "Список изменений после обновления: когда лаунчер обновился и перезапустился, загрузочный экран встречает сообщением «Обновление завершено» и списком нововведений установленной версии.",
+    ]),
     ("0.4.6", [
         "Лаунчер научился обновлять сам себя: если на GitHub вышел релиз новее, лаунчер сам предложит «Обновить лаунчер до v…» — скачает установщик, проверит его по SHA-256, запустит тихо и перезапустится; руками что-либо скачивать не нужно.",
         "Обновление лаунчера предлагается раньше обновления плеера: свежий лаунчер гарантирует корректную установку новых версий плеера (старые копии лаунчера, например v0.4.2, сами не умели ставить плеер).",
@@ -691,6 +714,50 @@ def launcher_update_available(remote_version: str) -> bool:
         return False
 
 
+def updated_marker_path() -> Path:
+    """Путь маркера самообновления (рядом с launcher.ini)."""
+    return app_base() / UPDATED_MARKER
+
+
+def write_updated_marker(to_version: str) -> None:
+    """v0.4.7: перед самообновлением лаунчера — маркер «обновляюсь до <ver>».
+
+    Новый экземпляр лаунчера по этому маркеру покажет на загрузочном
+    экране «Обновление завершено» со списком изменений установленной
+    версии. Если обновление не случилось (установщик не запустился),
+    маркер удалится как устаревший при следующем старте: его версия
+    не совпадёт с версией запустившейся сборки (read_updated_marker).
+    """
+    try:
+        data = {"from": RELEASE_VERSION, "to": str(to_version or ""),
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        p = updated_marker_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass  # маркер — украшение: его потеря не ломает обновление
+
+
+def read_updated_marker() -> Optional[Dict[str, Any]]:
+    """Маркер самообновления, если он указывает на ТЕКУЩУЮ сборку.
+
+    Возвращает словарь {from, to, ts} или None (нет файла, мусор,
+    устаревший маркер — тогда он сразу удаляется).
+    """
+    try:
+        p = updated_marker_path()
+        if not p.is_file():
+            return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or \
+                str(data.get("to", "")) != RELEASE_VERSION:
+            p.unlink()  # устаревший/чужой маркер — убрать
+            return None
+        return data
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def resolve_update_source(settings) -> Dict[str, Any]:
     """Определяет источник обновлений. Приоритет: GitHub -> манифест.
 
@@ -961,7 +1028,7 @@ from PyQt6.QtWidgets import (
     QMenu, QSystemTrayIcon
 )
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QTimer, QSettings,
-                          QRect, QProcess)
+                          QRect, QProcess, QEventLoop)
 from PyQt6.QtGui import QPixmap, QPainter, QColor, QLinearGradient, QPen, QFont, QIcon
 # QAction в PyQt6 живёт в QtGui, в PyQt5 (fake-PyQt6 на Win7) — в QtWidgets
 try:
@@ -1411,6 +1478,23 @@ def news_html(extra_head: str = "") -> str:
     return "".join(parts)
 
 
+def version_news_html(ver: str) -> str:
+    """v0.4.7: встроенные новости одной версии -> HTML.
+
+    Для экрана загрузочного экрана «Обновление завершено» — список
+    изменений той версии, до которой лаунчер только что обновился.
+    """
+    for v, items in NEWS:
+        if v != ver:
+            continue
+        parts = ["<p style='margin:8px 0 2px 0;'><b style='color:{0};"
+                 "font-size:13px;'>v{1} — что нового</b></p>".format(ACCENT, v)]
+        for it in items:
+            parts.append("<p style='margin:3px 0 3px 14px;'>• {}</p>".format(it))
+        return "".join(parts)
+    return ""
+
+
 def release_notes_html(src: Dict[str, Any]) -> str:
     """Заметки релиза с GitHub -> HTML-блок для верха новостной ленты."""
     notes = str(src.get("notes", "") or "").strip()
@@ -1526,6 +1610,25 @@ LAUNCHER_QSS = """
     QProgressBar::chunk {{ border-radius: 7px;
         background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
             stop:0 #00e5ff, stop:1 #3d5afe); }}
+    QDialog#SplashRoot {{ border: 1px solid {border}; }}
+    QLabel#SplashTitle {{ font-size: 21px; font-weight: bold; color: #ffffff;
+                          letter-spacing: 2px; }}
+    QLabel#SplashSub {{ color: {muted}; font-size: 11px; }}
+    QLabel#SplashStatus {{ font-size: 13px; color: {text}; font-weight: bold; }}
+    QLabel#SplashFoot {{ color: {muted}; font-size: 10px; }}
+    QPushButton#SplashPrimary {{
+        background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+            stop:0 #00e5ff, stop:1 #00a8d8);
+        color: #061018; font-weight: bold; font-size: 14px;
+        border: none; border-radius: 8px; padding: 10px 18px;
+    }}
+    QPushButton#SplashPrimary:hover {{
+        background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+            stop:0 #33ecff, stop:1 #00c0ee);
+        color: #061018;
+    }}
+    QPushButton#SplashPrimary:disabled {{ background-color: {bg3};
+                                          color: {muted}; }}
 """.format(bg=BG, bg2=BG2, bg3=BG3, border=BORDER, accent=ACCENT,
            accent2=ACCENT2, text=TEXT, muted=MUTED, warn=WARN)
 
@@ -1787,7 +1890,10 @@ class LauncherWindow(QMainWindow):
         self.refresh_state()
         self.log("Лаунчер v{} запущен (сборка плеера {})".format(
             LAUNCHER_VERSION, "Win7" if IS_WIN7_BUILD else "основная"))
-        QTimer.singleShot(700, self.startup_check)
+        # v0.4.7: проверка обновлений выполняется на загрузочном экране
+        # ДО создания окна (см. main() и SplashDialog.exec_check) —
+        # повторная проверка при старте не нужна; startup_check остался
+        # для совместимости тестов и ручного вызова
         # v0.4.4: опрос состояния плеера — кнопки запуска активны,
         # только пока плеер закрыт
         self._player_timer = QTimer(self)
@@ -1845,6 +1951,7 @@ class LauncherWindow(QMainWindow):
         dlg = ShotPreview(scaled, caption, self)
         dlg.setModal(True)
         dlg.exec()
+
 
     # ---------- журнал ----------
 
@@ -2491,6 +2598,12 @@ class LauncherWindow(QMainWindow):
             # а не плеера (плеер мог быть ещё не установлен)
             check_file = LAUNCHER_FILE if kind_hint == "launcher" \
                 else PLAYER_SCRIPT
+            if kind_hint == "launcher":
+                # v0.4.7: маркер «обновляюсь до <ver>» — новый экземпляр
+                # лаунчера покажет на загрузочном экране «Обновление
+                # завершено» со списком изменений установленной версии
+                write_updated_marker(
+                    str((self._pending or {}).get("version", "")))
             self._install_thread = InstallWorker(kind, target, desktop, startmenu,
                                                  setup_path=path,
                                                  check_file=check_file)
@@ -2609,6 +2722,275 @@ class LauncherWindow(QMainWindow):
         event.accept()
 
 
+class SplashDialog(QDialog):
+    """Загрузочный экран лаунчера (v0.4.7).
+
+    Показывается ДО главного окна: логотип, версия, проверка обновлений
+    прямо на загрузочном экране. Если вышла новая версия — на экране
+    появляются список изменений (заметки релиза с GitHub) и кнопки
+    «Обновить» / «Пропустить»; если всё свежо — экран сам закрывается
+    и открывает главное окно. После самообновления лаунчера (маркер
+    launcher_updated.json указывает на текущую сборку) экран показывает
+    «Обновление завершено» со списком изменений установленной версии.
+    """
+
+    def __init__(self):
+        super().__init__(None)
+        self.setObjectName("SplashRoot")
+        self.setWindowTitle(APP_TITLE)
+        # Без рамки и поверх остальных окон; мягкая тень не нужна — фон тёмный
+        self.setWindowFlags(Qt.WindowType.Dialog |
+                            Qt.WindowType.FramelessWindowHint |
+                            Qt.WindowType.WindowStaysOnTopHint)
+        self.setStyleSheet(LAUNCHER_QSS)
+        self.setFixedWidth(460)
+        self._loop: Optional[QEventLoop] = None
+        self._worker: Optional[CheckWorker] = None
+        self._outcome: Dict[str, Any] = {"status": "failed", "src": None,
+                                         "update": False, "err": ""}
+        self._start_ts = 0.0
+        self._just_updated = False
+        self._autoclose: Optional[QTimer] = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 22, 24, 16)
+        root.setSpacing(10)
+
+        logo = QLabel()
+        logo.setPixmap(draw_logo(84))
+        logo.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        root.addWidget(logo)
+
+        t = QLabel("HOX MUSIC PLAYER")
+        t.setObjectName("SplashTitle")
+        t.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        root.addWidget(t)
+
+        sub = QLabel("Лаунчер v{} — релиз v{}{}".format(
+            LAUNCHER_VERSION, RELEASE_VERSION,
+            " · сборка Win7" if IS_WIN7_BUILD else ""))
+        sub.setObjectName("SplashSub")
+        sub.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        root.addWidget(sub)
+
+        self.status_label = QLabel("Загрузка…")
+        self.status_label.setObjectName("SplashStatus")
+        self.status_label.setWordWrap(True)
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        root.addWidget(self.status_label)
+
+        self.busy = QProgressBar()
+        self.busy.setRange(0, 0)  # «занят» — бегущая полоса
+        self.busy.setTextVisible(False)
+        self.busy.setFixedHeight(10)
+        root.addWidget(self.busy)
+
+        self.news_box = QTextEdit()
+        self.news_box.setObjectName("NewsBox")
+        self.news_box.setReadOnly(True)
+        self.news_box.hide()
+        root.addWidget(self.news_box, 1)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(8)
+        self.btn_update = QPushButton("Обновить")
+        self.btn_update.setObjectName("SplashPrimary")
+        self.btn_update.clicked.connect(self._on_update)
+        self.btn_update.hide()
+        btns.addWidget(self.btn_update, 1)
+        self.btn_skip = QPushButton("Пропустить")
+        self.btn_skip.clicked.connect(self._on_skip)
+        self.btn_skip.hide()
+        btns.addWidget(self.btn_skip)
+        root.addLayout(btns)
+
+        foot = QLabel("Ранняя бета — обновления с GitHub Releases")
+        foot.setObjectName("SplashFoot")
+        foot.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        root.addWidget(foot)
+
+    # ---------- геометрия ----------
+
+    def _center(self) -> None:
+        """Подогнать размер под содержимое и поставить по центру экрана."""
+        scr = QApplication.primaryScreen()
+        geo = scr.availableGeometry() if scr else QRect(0, 0, 1366, 768)
+        self.adjustSize()
+        self.move(geo.center().x() - self.width() // 2,
+                  geo.center().y() - self.height() // 2)
+
+    # ---------- экраны ----------
+
+    def _show_update_wait(self, status: str, notes_html: str,
+                          btn_text: str, skip: bool = True) -> None:
+        """Экран «есть обновление»: статус, список изменений, кнопки.
+
+        Список изменений ДО обновления: заметки релиза с GitHub (или
+        встроенные новости этой версии, если релиз без описания).
+        """
+        if self._autoclose is not None:
+            self._autoclose.stop()  # экран с кнопками сам не закрывается
+        self.status_label.setText(status)
+        self.busy.hide()
+        self.news_box.setHtml(notes_html)
+        self.news_box.show()
+        self.btn_update.setText(btn_text)
+        self.btn_update.show()
+        self.btn_skip.setVisible(skip)
+        self._center()
+
+    def _show_done_screen(self) -> None:
+        """Экран «Обновление завершено» (после самообновления лаунчера).
+
+        Список изменений ПОСЛЕ обновления — встроенные новости
+        установленной версии (NEWS для RELEASE_VERSION); проверка
+        обновлений продолжается в фоне: если выйдет релиз ещё новее,
+        экран переключится на предложение обновления.
+        """
+        self._just_updated = True
+        self.status_label.setText(
+            "Обновление завершено — лаунчер v{} (релиз v{})".format(
+                LAUNCHER_VERSION, RELEASE_VERSION))
+        html = version_news_html(RELEASE_VERSION) or (
+            "<p style='margin:2px 0 2px 12px;color:{0};'>Установлена "
+            "версия v{1}.</p>".format(MUTED, RELEASE_VERSION))
+        self.news_box.setHtml(html)
+        self.news_box.show()
+        self.btn_update.setText("Продолжить")
+        self.btn_update.show()
+        self.btn_skip.hide()
+        self._center()
+
+    # ---------- выполнение ----------
+
+    def exec_check(self) -> Dict[str, Any]:
+        """Показать экран и проверить обновления (main ждёт результат).
+
+        Возвращает {status: ok|failed, src, update, err}: src — результат
+        проверки (при status=ok), update — нажал ли пользователь
+        «Обновить» на загрузочном экране.
+        """
+        self._start_ts = time.monotonic()
+        if read_updated_marker() is not None:
+            # v0.4.7: лаунчер только что обновился (маркер указывает на
+            # эту сборку) — сразу показываем «Обновление завершено»;
+            # маркер используется: экран показывается ОДИН раз, при
+            # следующих запусках будет обычный загрузочный экран
+            try:
+                updated_marker_path().unlink()
+            except Exception:  # noqa: BLE001
+                pass
+            self._show_done_screen()
+            self._autoclose = QTimer(self)
+            self._autoclose.setSingleShot(True)
+            self._autoclose.timeout.connect(self._finish)
+            self._autoclose.start(SPLASH_DONE_AUTOCLOSE_MS)
+        settings = QSettings(str(app_base() / "launcher.ini"),
+                             QSettings.Format.IniFormat)
+        repo = str(settings.value("updates/github_repo", "") or "").strip() \
+            or GITHUB_REPO.strip()
+        murl = str(settings.value("updates/manifest_url", "") or "").strip()
+        self._worker = CheckWorker(repo, murl)
+        self._worker.resolved.connect(self._on_resolved)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.start()
+        self._center()
+        self.show()
+        self.raise_()
+        loop = QEventLoop()
+        self._loop = loop
+        loop.exec()
+        self.hide()
+        return self._outcome
+
+    def _finish(self) -> None:
+        """Закрыть экран (не раньше SPLASH_MIN_SHOW_MS от старта —
+        чтобы не мигал, если проверка была мгновенной)."""
+        elapsed = (time.monotonic() - self._start_ts) * 1000.0
+        delay = max(0, int(SPLASH_MIN_SHOW_MS - elapsed))
+        QTimer.singleShot(delay, self._close_now)
+
+    def _close_now(self) -> None:
+        if self._loop is not None:
+            self._loop.quit()
+
+    def _auto_finish(self, ms: int) -> None:
+        """Авто-закрытие через ms мс (плюс минимальное время показа)."""
+        QTimer.singleShot(ms, self._finish)
+
+    # ---------- ответ проверки ----------
+
+    def _on_resolved(self, src: Dict[str, Any]) -> None:
+        self._outcome = {"status": "ok", "src": dict(src), "update": False,
+                         "err": ""}
+        if src.get("kind") == "none":
+            self.status_label.setText(
+                "Источник обновлений не настроен — продолжаю автономно")
+            self.busy.hide()
+            self._auto_finish(700)
+            return
+        remote = str(src.get("version", ""))
+        if bool(src.get("launcher_update")):
+            self._show_update_wait(
+                "ДОСТУПНО ОБНОВЛЕНИЕ ЛАУНЧЕРА: v{} (у вас v{})".format(
+                    remote, RELEASE_VERSION),
+                release_notes_html(src),
+                "⬆  Обновить до v{}".format(remote))
+            return
+        # плеер: установлен, цел, свеж ли?
+        ok, detail = player_integrity()
+        local = read_player_version() or "0"
+        try:
+            has_update = parse_version(remote) > parse_version(local)
+        except Exception:  # noqa: BLE001
+            has_update = False
+        if not ok or has_update:
+            if has_update:
+                status = "ТРЕБУЕТСЯ ОБНОВЛЕНИЕ плеера: v{} (у вас {})".format(
+                    remote, local if local != "0" else "не установлен")
+            else:
+                status = "ТРЕБУЕТСЯ ОБНОВЛЕНИЕ: {}".format(detail)
+            self._show_update_wait(
+                status, release_notes_html(src),
+                "⬇  Обновить до v{}".format(remote))
+            return
+        if self._just_updated:
+            # экран «Обновление завершено» не перебиваем — просто
+            # останавливаем бегунок и даём экрану закрыться самому
+            self.busy.hide()
+            self._auto_finish(600)
+            return
+        self.status_label.setText(
+            "У вас последняя версия — лаунчер v{}, плеер v{}".format(
+                LAUNCHER_VERSION, local))
+        self.busy.hide()
+        self._auto_finish(800)
+
+    def _on_failed(self, err: str) -> None:
+        self._outcome = {"status": "failed", "src": None, "update": False,
+                         "err": str(err)}
+        if not self._just_updated:
+            self.status_label.setText(
+                "Не удалось проверить обновления (нет интернета?) — "
+                "открываю лаунчер")
+        self.busy.hide()
+        self._auto_finish(1400)
+
+    # ---------- кнопки ----------
+
+    def _on_update(self) -> None:
+        """«Обновить до v…» или «Продолжить» (после обновления)."""
+        if not self._just_updated:
+            self._outcome["update"] = True
+        self._close_now()
+
+    def _on_skip(self) -> None:
+        self._close_now()
+
+    def reject(self) -> None:  # noqa: N802  (ESC / системное закрытие)
+        self._close_now()
+
+
 def main():
     os.environ.setdefault("QT_LOGGING_RULES", "*.debug=false")
     app = QApplication(sys.argv)
@@ -2620,9 +3002,22 @@ def main():
     srv = _single_bind()
     if srv is None and _single_notify_existing():
         return
+    # v0.4.7: загрузочный экран — проверка обновлений прямо на нём,
+    # список изменений до обновления (заметки релиза) и после
+    # («Обновление завершено» по маркеру самообновления)
+    splash = SplashDialog()
+    outcome = splash.exec_check()
     win = LauncherWindow()
     win.attach_single_listener(srv)
     win.show()
+    if outcome.get("src") is not None:
+        # проверка уже выполнена на загрузочном экране — применяем её
+        # результат без повторного запроса к GitHub
+        win.on_source_resolved(dict(outcome["src"]), auto=True)
+        if outcome.get("update") and win._pending is not None:
+            win.start_update()
+    else:
+        win.on_check_failed(str(outcome.get("err", "")), auto=True)
     sys.exit(app.exec())
 
 
