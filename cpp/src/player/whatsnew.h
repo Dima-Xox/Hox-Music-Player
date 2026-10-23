@@ -1,0 +1,53 @@
+#pragma once
+#include <QString>
+#include <QStringList>
+
+// Окно «Что нового»: список изменений по версиям (самая новая вверху).
+// Показывается один раз на версию (версия сохраняется в настройках).
+namespace WhatsNew {
+
+struct Entry {
+    const char *version;
+    const char *items;   // пункты, разделённые \n
+};
+
+inline const Entry kEntries[] = {
+    { "0.5.0",
+      "Плеер переписан на C++ (Qt 6): не требуется Python, установка стала заметно легче и быстрее.\n"
+      "Установщик ставит плеер сразу — скачивать архив плеера из лаунчера больше не нужно.\n"
+      "Караоке, пословная подсветка (LRC A2), клик по строке с учётом сдвига, миниплеер, темы, визуализатор — на месте.\n"
+      "Установщик автоматически ставит VC++ Redistributable (x64 и x86), если их нет в системе.\n"
+      "Лаунчер: проверка обновлений, трей, установка обновлений с GitHub Releases.\n"
+      "Системные требования: Windows 10/11 x64. Сборка для Windows 7 (Python-версия 0.4.x) осталась в старых релизах." },
+    { "0.4.8",
+      "Порядок альбомов исправлен: «Воспроизвести альбом» и «Играть все треки исполнителя» играют альбом в порядке его треков.\n"
+      "Клик по строке караоке учитывает ручной сдвиг синхронизации.\n"
+      "«Предыдущий трек» до выбора трека включает последний трек списка.\n"
+      "Номер трека «0» больше не показывается как прочерк.\n"
+      "Подсветка играющего трека не сбрасывается после сканирования папок." },
+    { "0.4.7",
+      "Лаунчер 3.7: загрузочный экран с проверкой обновлений, список изменений до и после обновления.\n"
+      "Плеер без функциональных изменений." },
+};
+
+inline QString html()
+{
+    QString h = QStringLiteral(
+        "<html><body style='font-size:13px;'>");
+    for (const Entry &e : kEntries) {
+        h += QStringLiteral("<h3 style='margin-bottom:2px;'>Версия %1</h3><ul>").arg(QString::fromLatin1(e.version));
+        const QStringList items = QString::fromLatin1(e.items).split(QLatin1Char('\n'));
+        for (const QString &it : items)
+            h += QStringLiteral("<li>%1</li>").arg(it);
+        h += QStringLiteral("</ul>");
+    }
+    h += QStringLiteral("</body></html>");
+    return h;
+}
+
+inline QString latestVersion()
+{
+    return QString::fromLatin1(kEntries[0].version);
+}
+
+} // namespace WhatsNew
