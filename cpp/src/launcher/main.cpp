@@ -1,7 +1,8 @@
 // HoxLauncher — менеджер плеера (C++/Qt 6).
-// Возможности: проверка обновлений с GitHub Releases, скачивание установщика
+// Возможности: плеер скачивается и устанавливается С GitHub под управлением
+// лаунчера: проверка обновлений с GitHub Releases, скачивание установщика
 // с проверкой SHA-256, тихая установка с правами администратора (UAC),
-// запуск плеера, одиночный экземпляр, сворачивание в трей.
+// докачка плеера, если его нет, запуск плеера, одиночный экземпляр, трей.
 #include "version.h"
 
 #include <QApplication>
@@ -27,6 +28,8 @@
 #include <QLocalSocket>
 #include <QCommandLineParser>
 #include <QCryptographicHash>
+#include <QProcess>
+#include <QRegularExpression>
 #include <QFile>
 #include <QFileInfo>
 #include <QDir>
@@ -45,6 +48,13 @@
 
 static constexpr const char *kReleasesApi =
     "https://api.github.com/repos/" GITHUB_REPO "/releases/latest";
+
+// Глобальные указатели: сервер одиночного экземпляра нужно закрыть перед
+// перезапуском лаунчера после тихого обновления, окно — развернуть при
+// повторном запуске.
+class LauncherWindow;
+static QLocalServer  *g_instanceServer  = nullptr;
+static LauncherWindow *g_launcherWindow = nullptr;
 
 static int parseVersion(const QString &v)
 {
@@ -164,16 +174,19 @@ protected:
 private slots:
     void refreshStatusLine()
     {
-        QFileInfo playerExe(playerPath());
-        if (playerExe.isFile()) {
-            // версия плеера — из его ресурса не достать легко; отметим наличие
-            m_status->setText(QStringLiteral("Плеер установлен: %1").arg(playerExe.absoluteFilePath()));
+        if (QFileInfo::exists(playerPath())) {
+            const QString v = m_playerVersion.isEmpty()
+                                  ? QString() : QStringLiteral(" — v") + m_playerVersion;
+            m_status->setText(QStringLiteral("Плеер установлен%1. Обновления лаунчер проверяет сам.").arg(v));
             m_btnPlay->setEnabled(true);
         } else {
             m_status->setText(QStringLiteral(
                 "Плеер не найден рядом с лаунчером (HoxPlayer.exe).\n"
-                "Запустите установщик Hox-Setup-*.exe — он ставит плеер и лаунчер вместе."));
+                "Нажмите «Скачать плеер с GitHub» — лаунчер сам скачает последнюю версию "
+                "с GitHub Releases и тихо установит её."));
             m_btnPlay->setEnabled(false);
+            m_btnUpdate->setText(QStringLiteral("Скачать плеер с GitHub"));
+            m_btnUpdate->show();
         }
     }
 
@@ -210,26 +223,60 @@ private slots:
                     + rep->errorString() + QStringLiteral(")"));
                 return;
             }
-            const QJsonDocument doc = QJsonDocument::fromJson(rep->readAll());
-            const QJsonObject rel = doc.object();
+            const QJsonObject rel = QJsonDocument::fromJson(rep->readAll()).object();
             const QString tag = rel.value(QStringLiteral("tag_name")).toString();
             const QString notes = rel.value(QStringLiteral("body")).toString();
             if (tag.isEmpty()) {
                 log(QStringLiteral("Не удалось прочитать ответ GitHub"));
                 return;
             }
-            if (parseVersion(tag) <= parseVersion(QStringLiteral(APP_VERSION))) {
-                log(QStringLiteral("У вас самая свежая версия (v") + QStringLiteral(APP_VERSION)
-                    + QStringLiteral("), релиз на GitHub: ") + tag);
-                refreshStatusLine();
-                return;
-            }
             m_remoteTag = tag;
             m_remoteNotes = notes;
-            m_btnUpdate->setText(QStringLiteral("Обновить до v") + tag.mid(1));
-            m_btnUpdate->show();
-            log(QStringLiteral("Доступна новая версия: ") + tag
-                + QStringLiteral(" — нажмите «Обновить»"));
+
+            // версия ИМЕННО плеера: лаунчер и плеер выходят вместе, но плеер
+            // могли удалить или заменить отдельно от лаунчера
+            const bool havePlayer = QFileInfo::exists(playerPath());
+            QString playerVer;
+            if (havePlayer) {
+                playerVer = detectPlayerVersion();
+                m_playerVersion = playerVer;
+            }
+            if (havePlayer) {
+                const QString v = playerVer.isEmpty() ? QString()
+                                                      : QStringLiteral(" — v") + playerVer;
+                m_status->setText(QStringLiteral("Плеер установлен%1.").arg(v));
+                m_btnPlay->setEnabled(true);
+            } else {
+                m_status->setText(QStringLiteral("Плеер не найден — скачается с GitHub."));
+                m_btnPlay->setEnabled(false);
+            }
+
+            // с чем сравнивать релиз: с версией плеера; если её узнать не
+            // удалось — с версией лаунчера (они всегда выходят вместе)
+            const QString base = havePlayer ? (playerVer.isEmpty() ? QStringLiteral(APP_VERSION)
+                                                                   : playerVer)
+                                            : QStringLiteral("0.0.0");
+            const QString relVer = tag.startsWith(QLatin1Char('v')) ? tag.mid(1) : tag;
+            if (parseVersion(tag) > parseVersion(base)) {
+                m_btnUpdate->setText(havePlayer
+                    ? QStringLiteral("Обновить плеер до v") + relVer
+                    : QStringLiteral("Скачать плеер v") + relVer + QStringLiteral(" с GitHub"));
+                m_btnUpdate->show();
+                log(QStringLiteral("Доступна новая версия: ") + tag
+                    + QStringLiteral(" — нажмите «Обновить»"));
+                if (!notes.isEmpty())
+                    log(QStringLiteral("Изменения:\n") + notes.left(600));
+            } else if (!havePlayer) {
+                m_btnUpdate->setText(QStringLiteral("Скачать плеер v") + relVer
+                                     + QStringLiteral(" с GitHub"));
+                m_btnUpdate->show();
+                log(QStringLiteral("Плеер не установлен — можно скачать релиз ") + tag);
+            } else {
+                m_btnUpdate->hide();
+                log(QStringLiteral("У вас самая свежая версия (плеер v")
+                    + (playerVer.isEmpty() ? QStringLiteral(APP_VERSION) : playerVer)
+                    + QStringLiteral("), релиз на GitHub: ") + tag);
+            }
         });
     }
 
@@ -252,8 +299,10 @@ private slots:
                 failUpdate(QStringLiteral("Ошибка сети: ") + rep->errorString());
                 return;
             }
-            const QJsonArray assets =
-                QJsonDocument::fromJson(rep->readAll()).object().value(QStringLiteral("assets")).toArray();
+            const QJsonObject rel = QJsonDocument::fromJson(rep->readAll()).object();
+            if (m_remoteTag.isEmpty())   // кнопку нажали до завершения проверки
+                m_remoteTag = rel.value(QStringLiteral("tag_name")).toString();
+            const QJsonArray assets = rel.value(QStringLiteral("assets")).toArray();
             QString setupUrl, shaUrl;
             for (const QJsonValue &v : assets) {
                 const QJsonObject a = v.toObject();
@@ -287,6 +336,41 @@ private slots:
                 });
             });
         });
+    }
+
+private:
+    // Версия установленного плеера: спрашиваем сам HoxPlayer.exe (--version),
+    // при неудаче — запись установщика в реестре. Пусто — узнать не удалось.
+    QString detectPlayerVersion() const
+    {
+        const QString exe = playerPath();
+        if (!QFileInfo::exists(exe))
+            return QString();
+        QProcess p;
+        p.start(exe, QStringList() << QStringLiteral("--version"));
+        if (p.waitForStarted(2000) && p.waitForFinished(5000)) {
+            static const QRegularExpression rxVer(QStringLiteral("\\d+\\.\\d+\\.\\d+"));
+            const auto m = rxVer.match(QString::fromUtf8(p.readAllStandardOutput()));
+            if (m.hasMatch())
+                return m.captured(0);
+        }
+        QSettings reg(QStringLiteral(
+            "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Hoxmusicp"),
+            QSettings::NativeFormat);
+        return reg.value(QStringLiteral("DisplayVersion")).toString().trimmed();
+    }
+
+public:
+    // Запуск после тихого обновления: окно не показываем — сворачиваемся
+    // в трей и стартуем обновлённый плеер.
+    void startAfterUpdate()
+    {
+        log(QStringLiteral("Обновление установлено — запускаю плеер…"));
+        m_tray->showMessage(QStringLiteral("Hox"),
+                            QStringLiteral("Плеер обновлён — запускаю"),
+                            QSystemTrayIcon::Information, 3000);
+        QTimer::singleShot(500, this, &LauncherWindow::launchPlayer);
+        checkUpdates();
     }
 
 private:
@@ -367,8 +451,15 @@ private:
             m_btnUpdate->setEnabled(true);
             m_progress->hide();
             if (watcher->result()) {
+                // Обычно сюда не дойти: установщик на старте убивает лаунчер
+                // taskkill'ом и сам перезапускает его с --after-update. Ветка
+                // нужна, если taskkill не нашёл наш процесс.
                 log(QStringLiteral("Обновление установлено. Перезапускаю лаунчер…"));
-                QProcess::startDetached(QCoreApplication::applicationFilePath(), QStringList());
+                if (g_instanceServer)
+                    g_instanceServer->close();
+                QLocalServer::removeServer(QStringLiteral("HoxLauncherInstance"));
+                QProcess::startDetached(QCoreApplication::applicationFilePath(),
+                                        QStringList() << QStringLiteral("--after-update"));
                 qApp->quit();
             } else {
                 log(QStringLiteral("Установка не выполнена (UAC отменён или ошибка)."));
@@ -412,6 +503,7 @@ private:
     QSystemTrayIcon *m_tray = nullptr;
     QString m_remoteTag;
     QString m_remoteNotes;
+    QString m_playerVersion;   // версия установленного плеера (если известна)
     bool m_busy = false;
     bool m_checkBusy = false;
     bool m_trayHintShown = false;
@@ -430,18 +522,25 @@ int main(int argc, char *argv[])
     parser.addVersionOption();
     QCommandLineOption selfcheckOpt(QStringLiteral("selfcheck"),
                                     QStringLiteral("Проверка запуска (для CI)"));
+    QCommandLineOption afterUpdateOpt(QStringLiteral("after-update"),
+                                      QStringLiteral("Запуск после тихого обновления: в трей и старт плеера"));
     parser.addOption(selfcheckOpt);
+    parser.addOption(afterUpdateOpt);
     parser.process(app);
 
-    // одиночный экземпляр
+    // одиночный экземпляр: повторный запуск разворачивает открытое окно
     QLocalSocket sock;
     sock.connectToServer(QStringLiteral("HoxLauncherInstance"));
-    if (sock.waitForConnected(300))
+    if (sock.waitForConnected(300)) {
+        sock.write(QByteArrayLiteral("show\n"));
+        sock.flush();
+        sock.waitForBytesWritten(300);
         return 0;
+    }
 
     QLocalServer::removeServer(QStringLiteral("HoxLauncherInstance"));
-    QLocalServer *srv = new QLocalServer(&app);
-    srv->listen(QStringLiteral("HoxLauncherInstance"));
+    g_instanceServer = new QLocalServer(&app);
+    g_instanceServer->listen(QStringLiteral("HoxLauncherInstance"));
 
     if (parser.isSet(selfcheckOpt)) {
         qInfo("HoxLauncher selfcheck OK %s", APP_VERSION);
@@ -449,11 +548,26 @@ int main(int argc, char *argv[])
         return app.exec();
     }
 
-    (void)srv;  // сервер держится живым указателем через parent
+    // команда «show» от второго экземпляра — развернуть окно
+    QObject::connect(g_instanceServer, &QLocalServer::newConnection, &app, []() {
+        while (QLocalSocket *c = g_instanceServer->nextPendingConnection()) {
+            QObject::connect(c, &QLocalSocket::disconnected, c, &QLocalSocket::deleteLater);
+            QObject::connect(c, &QLocalSocket::readyRead, c, [c]() {
+                if (QString::fromUtf8(c->readAll()).contains(QLatin1String("show"))
+                    && g_launcherWindow)
+                    g_launcherWindow->showNormal();
+            });
+        }
+    });
 
     LauncherWindow w;
+    g_launcherWindow = &w;
     w.show();
-    return app.exec();
+    if (parser.isSet(afterUpdateOpt))
+        w.startAfterUpdate();
+    const int rc = app.exec();
+    QLocalServer::removeServer(QStringLiteral("HoxLauncherInstance"));
+    return rc;
 }
 
 #include "main.moc"

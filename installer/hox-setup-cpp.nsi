@@ -75,8 +75,10 @@ FunctionEnd
 
 Function .onInstSuccess
   ${If} ${Silent}
-    ; тихая установка (самообновление) — открываем плеер сами
-    Exec '"$INSTDIR\bin\HoxPlayer.exe"'
+    ; тихая установка (самообновление через лаунчер): taskkill на старте убил
+    ; лаунчер, поэтому перезапускаем его сами — он свернётся в трей и сам
+    ; запустит обновлённый плеер (--after-update)
+    Exec '"$INSTDIR\bin\HoxLauncher.exe" --after-update'
   ${EndIf}
 FunctionEnd
 
