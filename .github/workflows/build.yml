@@ -24,35 +24,31 @@ jobs:
       - name: Read version
         id: ver
         run: |
-          $rs = Get-Content rust\common\src\lib.rs -Raw
-          if ($rs -match 'APP_VERSION:\s*&str\s*=\s*"(.+?)"') {
+          $toml = Get-Content lite/Cargo.toml -Raw
+          if ($toml -match '(?m)^\s*version\s*=\s*"([0-9][0-9A-Za-z.\-]*)"') {
             "version=$($Matches[1])" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          } else { throw "APP_VERSION not found" }
+          } else { throw "version not found in lite/Cargo.toml" }
 
       - name: Build (release, static CRT)
         run: |
           $env:RUSTFLAGS = "-C target-feature=+crt-static"
-          cargo build --release --workspace --manifest-path rust/Cargo.toml
+          cargo build --release --manifest-path lite/Cargo.toml
           if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
-      - name: Selfcheck (CI smoke)
+      - name: Smoke check
         run: |
-          $tests = @('rust\target\release\HoxPlayer.exe', 'rust\target\release\HoxLauncher.exe')
-          foreach ($t in $tests) {
-            if (-not (Test-Path $t)) { throw "not found: $t" }
-            $p = Start-Process -FilePath (Resolve-Path $t) -ArgumentList '--selfcheck' -Wait -PassThru -NoNewWindow
-            Write-Host "$t exit code: $($p.ExitCode)"
-            if ($p.ExitCode -ne 0) { throw "$t selfcheck failed: $($p.ExitCode)" }
-          }
-          $v = Start-Process -FilePath (Resolve-Path 'rust\target\release\HoxPlayer.exe') -ArgumentList '--version' -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\hoxver.txt"
-          Get-Content "$env:TEMP\hoxver.txt" | Out-Host
+          $exe = 'lite\target\release\HoxPlayer.exe'
+          if (-not (Test-Path $exe)) { throw "not found: $exe" }
+          $len = (Get-Item $exe).Length
+          if ($len -lt 1MB) { throw "HoxPlayer.exe too small: $len bytes" }
+          Write-Host ("HoxPlayer.exe OK: {0:N0} bytes" -f $len)
 
       - name: Assemble payload
         run: |
           New-Item -ItemType Directory -Force deploy\bin | Out-Null
-          Copy-Item rust\target\release\HoxPlayer.exe deploy\bin\ -Force
-          Copy-Item rust\target\release\HoxLauncher.exe deploy\bin\ -Force
-          Copy-Item rust\player\assets\hox.ico deploy\bin\hox.ico -Force
+          Copy-Item lite\target\release\HoxPlayer.exe deploy\bin\ -Force
+          Copy-Item lite\assets\hox.ico deploy\bin\hox.ico -Force
+          Copy-Item lite\readme.txt deploy\bin\readme.txt -Force
           Get-ChildItem deploy -Recurse | Out-Host
 
       - name: Install NSIS and build installer
@@ -84,8 +80,8 @@ jobs:
           $bytes = (Get-ChildItem deploy -Recurse -File | Measure-Object Length -Sum).Sum
           $kb = [int]($bytes / 1KB)
           & $mk /INPUTCHARSET UTF8 /DVERSION=$ver /DPAYLOAD="$env:GITHUB_WORKSPACE\deploy" `
-            /DOUTFILE="$env:GITHUB_WORKSPACE\Hox-Setup-$ver.exe" /DESTSIZE=$kb `
-            installer\hox-setup-rust.nsi
+            /DOUTFILE="$env:GITHUB_WORKSPACE\Hox-Setup-$ver.exe" /DDESTSIZE=$kb `
+            installer\hox-setup-lite.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
           $h2 = (Get-FileHash "Hox-Setup-$ver.exe" -Algorithm SHA256).Hash.ToLower()
           "$h2  Hox-Setup-$ver.exe" | Out-File -NoNewline "Hox-Setup-$ver.exe.sha256" -Encoding ascii

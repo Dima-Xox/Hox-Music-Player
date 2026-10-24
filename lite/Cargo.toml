@@ -1,0 +1,32 @@
+[package]
+name = "hoxplayer-lite"
+version = "0.7.0"
+edition = "2021"
+license = "MIT"
+description = "Hox Music Player — минимальная версия на Rust (egui + rodio)"
+publish = false
+build = "build.rs"
+
+# Бинарник называется HoxPlayer.exe — имя, ожидаемое установщиком и ярлыками.
+[[bin]]
+name = "HoxPlayer"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts"] }
+rodio = { version = "0.20", default-features = false, features = [
+    "symphonia-mp3", "symphonia-flac", "symphonia-vorbis",
+    "symphonia-wav", "symphonia-aac", "symphonia-isomp4",
+] }
+lofty = "0.22"
+rfd = "0.15"
+walkdir = "2"
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
+codegen-units = 16
