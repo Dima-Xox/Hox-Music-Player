@@ -264,7 +264,6 @@ NEWS: List[Tuple[str, List[str]]] = [
 # от релиза к релизу.
 SHOTS: List[Tuple[str, str]] = [
     ("shot-main-aurora.png", "Главное окно — тема Aurora"),
-    ("shot-sync-aurora.png", "Синхронизатор текста"),
     ("shot-mini.png", "Мини-плеер"),
     ("shot-splash.png", "Сплэш-экран"),
 ]

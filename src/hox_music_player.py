@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QFormLayout, QMessageBox, QStatusBar, QTabWidget,
     QListWidget, QListWidgetItem, QScrollArea, QFrame, QSplitter,
     QSizeGrip, QSplashScreen, QTextBrowser, QGraphicsDropShadowEffect,
-    QMenu, QGridLayout, QGroupBox, QTextEdit, QPlainTextEdit
+    QMenu, QGridLayout, QGroupBox
 )
 from PyQt6.QtCore import (
     Qt, QUrl, QEvent, QTimer, QPoint, QThread, pyqtSignal,
@@ -428,32 +428,6 @@ def make_icon(name: str, color: Optional[QColor] = None, pixmap_size: int = 48) 
         p.drawEllipse(QPointF(s / 2, s / 2), s * 0.35, s * 0.35)
         p.drawEllipse(QPointF(s / 2, s / 2), s * 0.12, s * 0.12)
 
-    elif name == "sync":
-        # v0.3.7: круговые стрелки для кнопки «Инструменты» /
-        # пункта «Синхронизатор текста» (обновление/конвертация)
-        cx, cy = s / 2, s / 2
-        r = (s - 2 * m) / 2
-        rect = QRectF(cx - r, cy - r, 2 * r, 2 * r)
-        p.drawArc(rect, 15 * 16, 150 * 16)
-        p.drawArc(rect, 195 * 16, 150 * 16)
-        # Наконечники на концах дуг — по касательной, по ходу стрелки
-        for a_deg in (165, 345):
-            a = math.radians(a_deg)
-            ex = cx + r * math.cos(a)
-            ey = cy - r * math.sin(a)
-            tx, ty = -math.sin(a), -math.cos(a)
-            nx, ny = -ty, tx
-            tri = QPainterPath()
-            tri.moveTo(ex + tx * s * 0.11, ey + ty * s * 0.11)
-            tri.lineTo(ex + nx * s * 0.055, ey + ny * s * 0.055)
-            tri.lineTo(ex - nx * s * 0.055, ey - ny * s * 0.055)
-            tri.closeSubpath()
-            p.setBrush(color)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawPath(tri)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.setPen(pen)
-
     else:
         p.drawEllipse(QPointF(s / 2, s / 2), s * 0.3, s * 0.3)
 
@@ -749,9 +723,9 @@ def extract_lyrics(filepath: Path, duration_sec: float) -> Tuple[List[LyricLine]
         if audio is not None and audio.tags is not None:
             tags_items = list(audio.tags.items())
 
-            # v0.3.7, проход 1: TXXX:LYRICS_LRC — пословный enhanced LRC,
-            # который пишет «Синхронизатор текста». Самый богатый формат,
-            # поэтому проверяется первым независимо от порядка кадров.
+            # TXXX:LYRICS_LRC — пословный enhanced LRC, который пишут внешние
+            # инструменты синхронизации. Самый богатый формат, поэтому
+            # проверяется первым независимо от порядка кадров.
             for k, v in tags_items:
                 if k.upper() == 'TXXX:LYRICS_LRC' and hasattr(v, 'text'):
                     raw = v.text
@@ -1096,7 +1070,7 @@ class HoxSplashScreen(QSplashScreen):
         painter.drawText(
             0, 178, 520, 26,
             Qt.AlignmentFlag.AlignCenter,
-            "Hi-Res Audio Engine • Lyrics Sync • Live Visualizer"
+            "Hi-Res Audio Engine • Karaoke • Live Visualizer"
         )
 
         painter.setBrush(QColor("#282c3e"))
@@ -1851,619 +1825,6 @@ class SettingsDialog(QDialog):
         self.main_win.apply_mini_on_top()
         self.main_win.setup_folder_watcher()
         self.accept()
-
-
-# --- v0.3.7: Синхронизатор текста (перенос пользовательской утилиты) --------
-# Идея: отдельное окно «Инструменты → Синхронизатор текста» готовит
-# синхронизированный текст для трека (Demucs -> Whisper / выравнивание по
-# готовому тексту) и пишет его в теги результата. Плеер читает эти теги
-# (extract_lyrics), поэтому обработанный трек сразу играет с караоке.
-# Тяжёлые зависимости (demucs, whisper, lyrics_transcriber, ffmpeg) в
-# комплект плеера НЕ входят: они проверяются на месте, а их отсутствие
-# не мешает остальным функциям плеера.
-
-SYNC_INSTALL_HINT = ("Не хватает компонентов: {missing}.\n"
-                     "Установите их в Python плеера командой:\n"
-                     "python -m pip install demucs openai-whisper "
-                     "lyrics-transcriber imageio-ffmpeg")
-
-
-def _resolve_ffmpeg() -> str:
-    """Путь к ffmpeg: сначала системный, затем пакет imageio-ffmpeg.
-
-    Импорт imageio_ffmpeg ленивый — пакета может не быть, это не ошибка,
-    а просто «компонент не найден» (сообщение покажет рабочий поток).
-    """
-    sys_ff = shutil.which("ffmpeg")
-    if sys_ff:
-        return sys_ff
-    import imageio_ffmpeg  # необязательный пакет
-    return imageio_ffmpeg.get_ffmpeg_exe()
-
-
-def probe_sync_deps() -> Dict[str, bool]:
-    """Быстрый статус компонентов синхронизатора без импорта тяжёлых библиотек.
-
-    importlib.util.find_spec только ищет модуль на диске — torch/demucs
-    не загружаются, поэтому открытие окна остаётся мгновенным даже на
-    слабых машинах. Полная проверка (с реальным импортом) выполняется
-    в рабочем потоке при запуске обработки.
-    """
-    import importlib.util
-    has_ffmpeg = bool(shutil.which("ffmpeg")) or (
-        importlib.util.find_spec("imageio_ffmpeg") is not None)
-    return {
-        "ffmpeg": has_ffmpeg,
-        "demucs": importlib.util.find_spec("demucs") is not None,
-        "whisper": importlib.util.find_spec("whisper") is not None,
-        "lyrics_transcriber": importlib.util.find_spec("lyrics_transcriber") is not None,
-        "mutagen": importlib.util.find_spec("mutagen") is not None,
-    }
-
-
-class DropLineEdit(QLineEdit):
-    """Поле ввода с drag&drop: принимает только «свои» расширения файлов."""
-
-    def __init__(self, allowed_exts, placeholder: str = "", parent=None):
-        super().__init__(parent)
-        self.allowed_exts = tuple(e.lower() for e in allowed_exts)
-        self.setPlaceholderText(placeholder)
-        self.setAcceptDrops(True)
-
-    @staticmethod
-    def pick_dropped_path(paths, exts) -> str:
-        """Первый подходящий путь из перетащенных (вынесено для тестов)."""
-        for p in paths:
-            if p and Path(p).suffix.lower() in exts:
-                return p
-        return ""
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            paths = [u.toLocalFile() for u in event.mimeData().urls()]
-            if self.pick_dropped_path(paths, self.allowed_exts):
-                event.acceptProposedAction()
-                return
-        super().dragEnterEvent(event)
-
-    def dragMoveEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            super().dragMoveEvent(event)
-
-    def dropEvent(self, event):
-        paths = [u.toLocalFile() for u in event.mimeData().urls()]
-        path = self.pick_dropped_path(paths, self.allowed_exts)
-        if path:
-            self.setText(path)
-            event.acceptProposedAction()
-            return
-        super().dropEvent(event)
-
-
-class LyricsSyncWorker(QThread):
-    """Рабочий поток синхронизатора: Demucs -> Whisper/LyricsTranscriber -> LRC -> теги.
-
-    Все тяжёлые импорты выполняются лениво внутри методов — загрузка
-    модуля плеером не замедляется, а нехватка компонентов даёт понятное
-    сообщение (SYNC_INSTALL_HINT), а не падение.
-    Сигнал называется done (не finished): QThread уже имеет встроенный
-    сигнал finished() — перекрытие имён источник тихих ошибок.
-    """
-
-    progress = pyqtSignal(int)
-    log = pyqtSignal(str)
-    lrc_ready = pyqtSignal(str, str)   # line_lrc, word_lrc (второй может быть пустым)
-    done = pyqtSignal(bool, str)
-
-    def __init__(self, audio_path, lyrics_path, model_size, save_path):
-        super().__init__()
-        self.audio_path = audio_path
-        self.lyrics_path = lyrics_path
-        self.model_size = model_size
-        self.save_path = save_path
-        self.ffmpeg_path = ""
-        # Рабочая папка: временные чанки и LRC. Не CWD (он у установленного
-        # плеера непредсказуем), а профиль пользователя.
-        base_tmp = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        self.work_dir = os.path.join(base_tmp, "Hoxmusicp", "sync_tmp")
-
-    # -- helpers ---------------------------------------------------------
-    def _get_duration(self, path):
-        import mutagen as _mg
-        f = _mg.File(path)
-        if f is None or f.info is None:
-            raise RuntimeError(f"Не удалось прочитать длительность: {path}")
-        return float(f.info.length)
-
-    def _parse_lrc_to_sylt(self, lrc_path):
-        """Строки LRC -> [(текст, мс)] для кадра SYLT (пословные метки <..> срезаются)."""
-        frames = []
-        with open(lrc_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("[") and "]" not in line:
-                    continue
-                line = re.sub(r"<[^>]+>", "", line)
-                if "]" in line and line.startswith("["):
-                    tp, text = line.split("]", 1)
-                    try:
-                        m, s = tp.strip("[]").split(":")
-                        ms = int((float(m) * 60 + float(s)) * 1000)
-                        frames.append((text.strip(), ms))
-                    except ValueError:
-                        continue
-        return frames
-
-    def _separate_vocals(self):
-        os.makedirs(self.work_dir, exist_ok=True)
-        self.log.emit("Отделение вокала (Demucs)...")
-        stem = Path(self.audio_path).stem
-        subprocess.run(
-            ["demucs", "--two-stems=vocals", "-o", self.work_dir, self.audio_path],
-            check=True, capture_output=True, env=os.environ.copy()
-        )
-        vocal = Path(self.work_dir) / "htdemucs" / stem / "vocals.wav"
-        if not vocal.exists():
-            raise FileNotFoundError(f"Вокал не найден: {vocal}")
-        self.log.emit(f"Вокал отделён: {vocal}")
-        return str(vocal)
-
-    def _transcribe_word_level(self, audio_path):
-        import whisper
-        duration = self._get_duration(audio_path)
-        self.log.emit(f"Длительность: {duration:.1f} сек ({duration/60:.2f} мин)")
-        self.log.emit(f"Загрузка модели Whisper '{self.model_size}'...")
-        model = whisper.load_model(self.model_size)
-        self.log.emit("Слушаю песню от начала до конца...")
-
-        chunk_size, overlap = 30, 1.0
-        all_words = []
-        starts = list(range(0, int(duration), int(chunk_size - overlap)))
-
-        for i, start in enumerate(starts):
-            end = min(start + chunk_size, int(duration))
-            if start >= duration:
-                break
-            chunk_path = os.path.join(self.work_dir, f"_chunk_{i:04d}.wav")
-            subprocess.run([
-                self.ffmpeg_path, "-y", "-loglevel", "error",
-                "-ss", str(start), "-i", audio_path, "-to", str(end - start),
-                "-ar", "16000", "-ac", "1", chunk_path
-            ], check=True, capture_output=True)
-
-            res = model.transcribe(chunk_path, language="ru",
-                                   word_timestamps=True, verbose=False)
-            new_words = []
-            for seg in res["segments"]:
-                for w in seg.get("words", []):
-                    new_words.append({
-                        "word": w["word"],
-                        "start": w["start"] + start,
-                        "end": w["end"] + start,
-                    })
-
-            if all_words:
-                # Склейка перекрытия: убираем дубли слов из зоны перекрытия
-                ov_end = start + overlap
-                tail = [w for w in all_words[-30:] if w["start"] > ov_end - 2.0]
-                filtered = []
-                for w in new_words:
-                    if w["start"] < ov_end and any(
-                        pw["word"].strip().lower() == w["word"].strip().lower()
-                        and abs(pw["start"] - w["start"]) < 1.0
-                        for pw in tail
-                    ):
-                        continue
-                    filtered.append(w)
-                new_words = filtered
-
-            all_words.extend(new_words)
-            pct = min(int((end / duration) * 70), 70)
-            self.progress.emit(pct)
-            self.log.emit(f"Прослушано {end:.0f}/{duration:.0f} сек ({pct}%)")
-
-            try:
-                os.remove(chunk_path)
-            except OSError:
-                pass
-
-        self.log.emit(f"Распознано слов: {len(all_words)}")
-        return all_words
-
-    def _words_to_lrc(self, words, word_level):
-        """Слова Whisper -> LRC-файл (по строкам по паузе > 1.5 с)."""
-        os.makedirs(self.work_dir, exist_ok=True)  # самодостаточность (и для тестов)
-        lines, cur, prev_end = [], [], 0.0
-        for w in words:
-            text = w["word"].strip()
-            if not text:
-                continue
-            if cur and w["start"] - prev_end > 1.5:
-                lines.append(cur)
-                cur = []
-            cur.append(w)
-            prev_end = w["end"]
-        if cur:
-            lines.append(cur)
-
-        out_path = os.path.join(
-            self.work_dir, "lyrics_word.lrc" if word_level else "lyrics_line.lrc"
-        )
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write("[ti:Synchronized]\n[by:Hox sync]\n")
-            for line in lines:
-                start = line[0]["start"]
-                mm = int(start // 60)
-                ss = start % 60
-                if word_level:
-                    parts = []
-                    for w in line:
-                        wm = int(w["start"] // 60)
-                        ws = w["start"] % 60
-                        parts.append(f"<{wm:02d}:{ws:05.2f}>{w['word'].strip()}")
-                    f.write(f"[{mm:02d}:{ss:05.2f}]{''.join(parts)}\n")
-                else:
-                    text = " ".join(w["word"].strip() for w in line)
-                    f.write(f"[{mm:02d}:{ss:05.2f}]{text}\n")
-        return out_path
-
-    def _align_with_text(self, vocal_path):
-        self.log.emit(f"Выравнивание по готовому тексту (Whisper {self.model_size})...")
-        os.environ["WHISPER_MODEL"] = self.model_size
-        from lyrics_transcriber import LyricsTranscriber
-        tr = LyricsTranscriber(audio_filepath=vocal_path,
-                               lyrics_filepath=self.lyrics_path)
-        res = tr.generate()
-        lrc = res.get("midico_lrc_filepath") or res.get("lrc_filepath")
-        if not lrc or not os.path.exists(lrc):
-            raise RuntimeError("LRC не создан.")
-        self.log.emit(f"LRC готов: {lrc}")
-        return lrc
-
-    def _embed(self, target_path, line_lrc, word_lrc=None):
-        """Запись синхронного текста в теги результата (оригинал не трогаем).
-
-        MP3/WAV: SYLT (построчный синхронный текст) + TXXX:LYRICS_LRC
-        (пословный enhanced LRC — его плеер предпочитает всем остальным).
-        FLAC: LYRICS + LYRICS_LINE (Vorbis-комментарии).
-        """
-        from mutagen.id3 import ID3, SYLT, TXXX, Encoding
-        ext = Path(target_path).suffix.lower()
-        if ext == ".mp3":
-            from mutagen.mp3 import MP3
-            audio = MP3(target_path, ID3=ID3)
-            if audio.tags is None:
-                audio.add_tags()
-            audio.tags.delall("SYLT")
-            audio.tags.add(SYLT(
-                encoding=Encoding.UTF8, lang="rus", format=2, type=1,
-                desc="Synchronized lyrics",
-                text=self._parse_lrc_to_sylt(line_lrc)
-            ))
-            if word_lrc:
-                audio.tags.delall("TXXX:LYRICS_LRC")
-                audio.tags.add(TXXX(
-                    encoding=Encoding.UTF8, desc="LYRICS_LRC",
-                    text=Path(word_lrc).read_text(encoding="utf-8")
-                ))
-            audio.save(v2_version=3)
-            self.log.emit("MP3: записаны SYLT + TXXX:LYRICS_LRC.")
-            return
-        if ext == ".flac":
-            audio = FLAC(target_path)
-            audio["LYRICS"] = Path(word_lrc or line_lrc).read_text(encoding="utf-8")
-            audio["LYRICS_LINE"] = Path(line_lrc).read_text(encoding="utf-8")
-            audio.save()
-            self.log.emit("FLAC: записаны LYRICS + LYRICS_LINE.")
-            return
-        if ext == ".wav":
-            from mutagen.wave import WAVE
-            audio = WAVE(target_path)
-            if audio.tags is None:
-                audio.add_tags()
-            if "SYLT" in audio.tags:
-                del audio.tags["SYLT"]
-            audio.tags.add(SYLT(
-                encoding=Encoding.UTF8, lang="rus", format=2, type=1,
-                desc="Synchronized lyrics",
-                text=self._parse_lrc_to_sylt(line_lrc)
-            ))
-            if word_lrc:
-                if "TXXX:LYRICS_LRC" in audio.tags:
-                    del audio.tags["TXXX:LYRICS_LRC"]
-                audio.tags.add(TXXX(
-                    encoding=Encoding.UTF8, desc="LYRICS_LRC",
-                    text=Path(word_lrc).read_text(encoding="utf-8")
-                ))
-            audio.save()
-            self.log.emit("WAV: записаны SYLT + TXXX:LYRICS_LRC.")
-            return
-        raise ValueError(f"Формат {ext} не поддерживается.")
-
-    def _check_environment(self):
-        """Реальная проверка компонентов (с импортом). Возвращает список недостающих."""
-        missing = []
-        try:
-            self.ffmpeg_path = _resolve_ffmpeg()
-        except Exception:
-            missing.append("ffmpeg (или пакет imageio-ffmpeg)")
-        try:
-            import demucs  # noqa: F401
-        except Exception:
-            missing.append("demucs")
-        try:
-            import whisper  # noqa: F401
-        except Exception:
-            missing.append("openai-whisper")
-        if self.lyrics_path:
-            try:
-                import lyrics_transcriber  # noqa: F401
-            except Exception:
-                missing.append("lyrics-transcriber")
-        return missing
-
-    def run(self):
-        try:
-            src_ext = Path(self.audio_path).suffix.lower()
-            dst_ext = Path(self.save_path).suffix.lower()
-            if src_ext != dst_ext:
-                raise ValueError(
-                    f"Расширение результата ({dst_ext}) должно совпадать "
-                    f"с исходным ({src_ext}).")
-
-            self.log.emit("Проверка компонентов...")
-            os.makedirs(self.work_dir, exist_ok=True)
-            missing = self._check_environment()
-            if missing:
-                raise RuntimeError(SYNC_INSTALL_HINT.format(missing=", ".join(missing)))
-            self.log.emit(f"FFmpeg: {self.ffmpeg_path}")
-
-            vocal = self._separate_vocals()
-            self.progress.emit(10)
-
-            if self.lyrics_path:
-                line_lrc = self._align_with_text(vocal)
-                word_lrc = None
-            else:
-                words = self._transcribe_word_level(vocal)
-                if not words:
-                    raise RuntimeError("Не удалось распознать слова.")
-                line_lrc = self._words_to_lrc(words, word_level=False)
-                word_lrc = self._words_to_lrc(words, word_level=True)
-            self.progress.emit(80)
-
-            # Предпросмотр в окно до записи тегов
-            line_content = Path(line_lrc).read_text(encoding="utf-8")
-            word_content = Path(word_lrc).read_text(encoding="utf-8") if word_lrc else ""
-            self.lrc_ready.emit(line_content, word_content)
-
-            self.log.emit(f"Копирование оригинала -> {self.save_path}")
-            if Path(self.audio_path).resolve() != Path(self.save_path).resolve():
-                shutil.copy2(self.audio_path, self.save_path)
-            else:
-                self.log.emit("Путь совпадает с оригиналом — правки будут в исходном файле.")
-
-            self.log.emit("Запись тегов в результат...")
-            self._embed(self.save_path, line_lrc, word_lrc)
-            self.progress.emit(100)
-            self.done.emit(
-                True,
-                f"Готово! Файл сохранён:\n{self.save_path}\n"
-                f"Оригинал не изменён: {self.audio_path}"
-            )
-        except Exception as e:
-            self.log.emit(f"Ошибка: {e}")
-            self.done.emit(False, str(e))
-
-
-class LyricsSyncDialog(QDialog):
-    """Окно «Синхронизатор текста» (v0.3.7, немодальное).
-
-    Перенос пользовательской утилиты в плеер: поля аудио/текста с
-    drag&drop, выбор модели Whisper, прогресс, лог и предпросмотр LRC.
-    Стили берутся из глобальной темы приложения (никаких inline-стилей
-    на контейнерах — урок v0.3.1), поэтому окно перекрашивается вместе
-    со сменой темы без дополнительного кода.
-    """
-
-    AUDIO_EXTS = (".mp3", ".flac", ".wav")
-    TEXT_EXTS = (".txt", ".lrc")
-
-    def __init__(self, main_win: "MediaPlayerWindow"):
-        super().__init__(main_win)
-        self.main_win = main_win
-        self.setWindowTitle(f"Синхронизатор текста — {APP_FULL_TITLE}")
-        self.resize(760, 700)
-        self.setMinimumSize(620, 560)
-        self.worker: Optional[LyricsSyncWorker] = None
-
-        root = QVBoxLayout(self)
-
-        # Статус компонентов + подсказка установки (обновляется при открытии)
-        self.lbl_deps = QLabel(self._deps_text())
-        self.lbl_deps.setObjectName("SyncDeps")
-        self.lbl_deps.setWordWrap(True)
-        root.addWidget(self.lbl_deps)
-
-        g = QGroupBox("Входные файлы  ·  файлы можно перетащить прямо в поля")
-        gl = QVBoxLayout(g)
-
-        row_a = QHBoxLayout()
-        row_a.addWidget(QLabel("Аудио:"))
-        self.audio_edit = DropLineEdit(
-            self.AUDIO_EXTS, "MP3 / FLAC / WAV — перетащите или «Обзор…»")
-        row_a.addWidget(self.audio_edit, 1)
-        b1 = QPushButton("Обзор...")
-        b1.clicked.connect(self._browse_audio)
-        row_a.addWidget(b1)
-        gl.addLayout(row_a)
-
-        row_t = QHBoxLayout()
-        row_t.addWidget(QLabel("Текст:"))
-        self.lyrics_edit = DropLineEdit(
-            self.TEXT_EXTS, ".txt / .lrc — необязательно (иначе автораспознавание)")
-        row_t.addWidget(self.lyrics_edit, 1)
-        b2 = QPushButton("Обзор...")
-        b2.clicked.connect(self._browse_lyrics)
-        row_t.addWidget(b2)
-        gl.addLayout(row_t)
-        root.addWidget(g)
-
-        sg = QGroupBox("Настройки")
-        sl = QHBoxLayout(sg)
-        sl.addWidget(QLabel("Модель Whisper:"))
-        self.model_combo = QComboBox()
-        self.model_combo.addItems(["tiny", "base", "small", "medium", "large-v3"])
-        self.model_combo.setCurrentText("medium")
-        sl.addWidget(self.model_combo)
-        sl.addStretch(1)
-        root.addWidget(sg)
-
-        self.btn_start = QPushButton("Запустить (спросит, куда сохранить)")
-        self.btn_start.setObjectName("SyncStart")
-        self.btn_start.setMinimumHeight(40)
-        self.btn_start.clicked.connect(self._start)
-        root.addWidget(self.btn_start)
-
-        self.progress = QProgressBar()
-        self.progress.setValue(0)
-        root.addWidget(self.progress)
-
-        self.tabs = QTabWidget()
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        self.preview_view = QPlainTextEdit()
-        self.preview_view.setReadOnly(True)
-        self.preview_view.setPlaceholderText(
-            "Здесь появится синхронизированный текст (enhanced LRC) после обработки.")
-        self.tabs.addTab(self.log_view, "Лог")
-        self.tabs.addTab(self.preview_view, "Предпросмотр LRC")
-        root.addWidget(self.tabs, 1)
-
-        # Главный сценарий: обработать трек, который уже открыт в плеере
-        cur = self._current_track_path()
-        if cur:
-            self.audio_edit.setText(cur)
-            self.log_view.append(f"Аудио подставлено из плеера: {cur}")
-
-    # -- helpers ---------------------------------------------------------
-    def _current_track_path(self) -> str:
-        """Путь текущего трека плеера, если формат поддержан синхронизатором."""
-        try:
-            idx = self.main_win.current_index
-            tracks = self.main_win.tracks
-            if 0 <= idx < len(tracks):
-                p = tracks[idx].filepath
-                if p and Path(p).suffix.lower() in self.AUDIO_EXTS:
-                    return str(p)
-        except Exception:
-            pass
-        return ""
-
-    def _deps_text(self) -> str:
-        st = probe_sync_deps()
-
-        def mark(ok: bool) -> str:
-            return "найден" if ok else "не найден"
-
-        return ("Компоненты: FFmpeg — {ff} · Demucs — {dm} · Whisper — {ws} · "
-                "lyrics-transcriber — {lt} · mutagen — {mg}. Установка: "
-                "python -m pip install demucs openai-whisper lyrics-transcriber "
-                "imageio-ffmpeg").format(
-            ff=mark(st["ffmpeg"]), dm=mark(st["demucs"]), ws=mark(st["whisper"]),
-            lt=mark(st["lyrics_transcriber"]), mg=mark(st["mutagen"]))
-
-    def _suggest_save_path(self, audio_path: str) -> str:
-        p = Path(audio_path)
-        ext = p.suffix.lower()
-        filter_map = {
-            ".mp3": "MP3 (*.mp3)",
-            ".flac": "FLAC (*.flac)",
-            ".wav": "WAV (*.wav)",
-        }
-        default = str(p.with_name(f"{p.stem}_synced{ext}"))
-        save_path, _ = QFileDialog.getSaveFileName(
-            self, "Куда сохранить результат?", default,
-            filter_map.get(ext, "Все файлы (*)"))
-        return save_path
-
-    # -- слоты -----------------------------------------------------------
-    def _browse_audio(self):
-        p, _ = QFileDialog.getOpenFileName(
-            self, "Аудио", "", "Аудио (*.mp3 *.flac *.wav);;Все файлы (*)")
-        if p:
-            self.audio_edit.setText(p)
-
-    def _browse_lyrics(self):
-        p, _ = QFileDialog.getOpenFileName(
-            self, "Текст", "", "Текст (*.txt *.lrc);;Все файлы (*)")
-        if p:
-            self.lyrics_edit.setText(p)
-
-    def _start(self):
-        if self.worker is not None and self.worker.isRunning():
-            QMessageBox.information(
-                self, "Занято", "Обработка уже идёт — дождитесь завершения.")
-            return
-        a = self.audio_edit.text().strip()
-        if not a or not os.path.exists(a):
-            QMessageBox.warning(self, "Ошибка", "Выберите существующий аудиофайл.")
-            return
-        l = self.lyrics_edit.text().strip() or None
-        if l and not os.path.exists(l):
-            QMessageBox.warning(self, "Ошибка", "Файл текста не найден.")
-            return
-
-        save_path = self._suggest_save_path(a)
-        if not save_path:
-            return
-        src_ext = Path(a).suffix.lower()
-        if Path(save_path).suffix.lower() != src_ext:
-            save_path = str(Path(save_path).with_suffix(src_ext))
-
-        self.btn_start.setEnabled(False)
-        self.progress.setValue(0)
-        self.log_view.clear()
-        self.preview_view.clear()
-        self.tabs.setCurrentWidget(self.log_view)
-        self.log_view.append(f"Запуск...\nРезультат: {save_path}\n")
-
-        self.worker = LyricsSyncWorker(
-            a, l, self.model_combo.currentText(), save_path)
-        self.worker.log.connect(self.log_view.append)
-        self.worker.progress.connect(self.progress.setValue)
-        self.worker.lrc_ready.connect(self._on_lrc_ready)
-        self.worker.done.connect(self._on_done)
-        self.worker.start()
-
-    def _on_lrc_ready(self, line_content: str, word_content: str):
-        """Показывает LRC в предпросмотре и переключается на вкладку."""
-        self.preview_view.setPlainText(word_content if word_content else line_content)
-        self.tabs.setCurrentWidget(self.preview_view)
-
-    def _on_done(self, ok: bool, msg: str):
-        self.btn_start.setEnabled(True)
-        self.log_view.append(("\n[OK] " if ok else "\n[ОШИБКА] ") + msg)
-        (QMessageBox.information if ok else QMessageBox.critical)(
-            self, "Готово" if ok else "Ошибка", msg)
-
-    def closeEvent(self, event):
-        if self.worker is not None and self.worker.isRunning():
-            # Поток прерывать нельзя (Whisper/Demucs не поддерживают отмену) —
-            # окно просто прячется, обработка продолжается в фоне.
-            event.ignore()
-            self.hide()
-            try:
-                self.main_win.status_bar.showMessage(
-                    "Синхронизатор продолжает работу в фоне.", 4000)
-            except Exception:
-                pass
-            return
-        if getattr(self.main_win, "_sync_dialog", None) is self:
-            self.main_win._sync_dialog = None
-        super().closeEvent(event)
 
 
 # --- Обновлённый Миниплеер с временем трека, текущим плейлистом и синхро-текстом ---
@@ -4161,17 +3522,6 @@ QListWidget {
     background-color: $list_bg; border: 1px solid $list_border; border-radius: 10px; color: $list_text;
 }
 
-/* v0.3.7: окно «Синхронизатор текста» — лог и предпросмотр LRC */
-QTextEdit, QPlainTextEdit {
-    background-color: $input_bg; color: $table_text;
-    border: 1px solid $input_border; border-radius: 8px;
-    font-family: "Consolas", "Courier New", monospace; font-size: 9pt;
-    selection-background-color: $input_sel;
-}
-QTextEdit:focus, QPlainTextEdit:focus { border-color: $sub1; }
-QLabel#SyncDeps { color: $muted; font-size: 9pt; }
-QPushButton#SyncStart { font-size: 11pt; font-weight: bold; padding: 9px 14px; }
-QPushButton#SyncStart:hover { border-color: $sub1; }
 QListWidget::item { padding: 5px; border-radius: 6px; }
 QListWidget::item:selected { background-color: $sel_bg; color: #ffffff; }
 
@@ -4757,7 +4107,6 @@ class MediaPlayerWindow(QMainWindow):
         self.btn_open_files = QPushButton(" Добавить файлы")
         self.btn_open_folder = QPushButton(" Открыть папку")
         self.btn_rescan = QPushButton(" Проверить новые")
-        self.btn_tools = QPushButton(" Инструменты")
         self.btn_settings = QPushButton(" Настройки")
         # v0.3.3: векторные иконки у кнопок верхней панели (цвет темы;
         # при смене темы вызовется повторно из _refresh_theme_dependents)
@@ -4786,7 +4135,6 @@ class MediaPlayerWindow(QMainWindow):
         top_bar.addWidget(self.btn_rescan)
         top_bar.addWidget(QLabel("Сортировка:"))
         top_bar.addWidget(self.sort_combo, 1)
-        top_bar.addWidget(self.btn_tools)
         top_bar.addWidget(self.btn_settings)
         right_layout.addLayout(top_bar)
 
@@ -4898,9 +4246,6 @@ class MediaPlayerWindow(QMainWindow):
         if hasattr(self, "btn_settings"):
             self.btn_settings.setIcon(make_icon("settings", accent, 28))
             self.btn_settings.setIconSize(QSize(14, 14))
-        if hasattr(self, "btn_tools"):
-            self.btn_tools.setIcon(make_icon("sync", accent, 28))
-            self.btn_tools.setIconSize(QSize(14, 14))
         if hasattr(self, "btn_audio_out"):
             self.btn_audio_out.setIcon(make_icon("headphones", accent, 32))
             self.btn_audio_out.setIconSize(QSize(16, 16))
@@ -5163,7 +4508,6 @@ class MediaPlayerWindow(QMainWindow):
         self.btn_open_folder.clicked.connect(self.open_folder)
         self.btn_rescan.clicked.connect(lambda: self.check_folder_for_new_tracks(manual=True))
         self.btn_settings.clicked.connect(self.open_settings_dialog)
-        self.btn_tools.clicked.connect(self.show_tools_menu)
         self.btn_cancel_scan.clicked.connect(self.cancel_background_scan)
         self.sort_combo.currentIndexChanged.connect(self.apply_sorting)
 
@@ -5312,30 +4656,6 @@ class MediaPlayerWindow(QMainWindow):
     def open_settings_dialog(self):
         dlg = SettingsDialog(self)
         dlg.exec()
-
-    # --- v0.3.7: раздел «Инструменты» ------------------------------------
-    def show_tools_menu(self):
-        """Меню «Инструменты»: служебные утилиты в отдельных окнах."""
-        menu = QMenu(self)
-        act_sync = menu.addAction("Синхронизатор текста…")
-        act_sync.setIcon(make_icon("sync", QColor(T["sub1"]), 32))
-        act_sync.triggered.connect(self.open_sync_dialog)
-        menu.exec(self.btn_tools.mapToGlobal(
-            QPoint(0, self.btn_tools.height())))
-
-    def open_sync_dialog(self):
-        """Синхронизатор текста: немодальное окно — плеер продолжает играть.
-
-        Одно окно на приложение: повторный вызов поднимает уже открытое.
-        """
-        d = getattr(self, "_sync_dialog", None)
-        if d is not None and d.isVisible():
-            d.raise_()
-            d.activateWindow()
-            return
-        d = LyricsSyncDialog(self)
-        self._sync_dialog = d
-        d.show()
 
     def on_volume_changed(self, v: int):
         self.audio_output.setVolume(v / 100.0)
