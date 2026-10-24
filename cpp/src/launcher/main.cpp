@@ -1,7 +1,9 @@
 // HoxLauncher — менеджер плеера (C++/Qt 6).
 // Возможности: плеер скачивается и устанавливается С GitHub под управлением
-// лаунчера: проверка обновлений с GitHub Releases, скачивание установщика
-// с проверкой SHA-256, тихая установка с правами администратора (UAC),
+// лаунчера; авто-обновление лаунчера и плеера (в т.ч. отложенное — по расписанию);
+// уведомления-балуны «что нового» с описанием изменений релиза; проверка
+// обновлений с GitHub Releases, скачивание установщика с проверкой SHA-256,
+// тихая установка (UAC — только для VC++ Redistributable при их отсутствии);
 // докачка плеера, если его нет, запуск плеера, одиночный экземпляр, трей.
 #include "version.h"
 
@@ -35,6 +37,11 @@
 #include <QFileInfo>
 #include <QDir>
 #include <QTimer>
+#include <QDateTime>
+#include <QMessageBox>
+#include <QDesktopServices>
+#include <QActionGroup>
+#include <QUrl>
 #include <QDebug>
 #include <QFutureWatcher>
 #include <QtConcurrent>
@@ -68,6 +75,11 @@ static int parseVersion(const QString &v)
     return res;
 }
 
+static QString relVerOf(const QString &tag)
+{
+    return tag.startsWith(QLatin1Char('v')) ? tag.mid(1) : tag;
+}
+
 // Запущен ли процесс с таким именем (авто-обновление не должно перебивать
 // играющий плеер).
 static bool processRunning(const wchar_t *exeName)
@@ -92,12 +104,52 @@ static bool processRunning(const wchar_t *exeName)
 #endif
 }
 
+// Тело релиза (markdown) -> простой текст: маркеры списков, жирность и
+// обратные кавычки убираем, заголовок версии пропускаем (он в заголовке).
+static QString notesToPlain(const QString &md)
+{
+    QString out;
+    const QStringList lines = md.split(QLatin1Char('\n'));
+    for (const QString &raw : lines) {
+        QString line = raw.trimmed();
+        if (line.isEmpty()) {
+            if (!out.isEmpty() && !out.endsWith(QLatin1Char('\n')))
+                out += QLatin1Char('\n');
+            continue;
+        }
+        if (line.startsWith(QLatin1String("##")))
+            continue;
+        if (line.startsWith(QLatin1String("- ")) || line.startsWith(QLatin1String("* ")))
+            line = QStringLiteral("• ") + line.mid(2);
+        line.remove(QStringLiteral("**"));
+        line.remove(QLatin1Char('`'));
+        while (line.startsWith(QLatin1Char('#')))
+            line.remove(0, 1);
+        line = line.trimmed();
+        if (line.isEmpty())
+            continue;
+        out += line + QLatin1Char('\n');
+    }
+    return out.trimmed();
+}
+
+// Короткая строка для балуна трея (в Windows szInfo ~256 символов)
+static QString notesPreview(const QString &md, int maxChars)
+{
+    QString one = notesToPlain(md);
+    one.replace(QLatin1Char('\n'), QStringLiteral("  "));
+    if (one.size() > maxChars)
+        return one.left(maxChars).trimmed() + QStringLiteral("…");
+    return one;
+}
+
 class LauncherWindow : public QWidget {
     Q_OBJECT
 public:
     LauncherWindow() : m_net(new QNetworkAccessManager(this))
     {
         m_autoUpdate = QSettings().value(QStringLiteral("autoUpdate"), true).toBool();
+        m_updateDelayHours = QSettings().value(QStringLiteral("updateDelayHours"), 0).toInt();
         setWindowTitle(QStringLiteral("Hox — лаунчер v") + QStringLiteral(APP_VERSION));
         setWindowIcon(QIcon(QStringLiteral(":/app.ico")));
         setFixedSize(560, 430);
@@ -137,12 +189,15 @@ public:
 
         m_btnPlay = new QPushButton(QStringLiteral("Запустить плеер"), this);
         m_btnCheck = new QPushButton(QStringLiteral("Проверить обновления"), this);
+        m_btnNotes = new QPushButton(QStringLiteral("Что нового"), this);
+        m_btnNotes->hide();
         m_btnUpdate = new QPushButton(this);
         m_btnUpdate->hide();
 
         auto *row = new QHBoxLayout;
         row->addWidget(m_btnPlay);
         row->addWidget(m_btnCheck);
+        row->addWidget(m_btnNotes);
         row->addStretch(1);
 
         auto *lay = new QVBoxLayout(this);
@@ -158,6 +213,7 @@ public:
         connect(m_btnPlay, &QPushButton::clicked, this, &LauncherWindow::launchPlayer);
         connect(m_btnCheck, &QPushButton::clicked, this, &LauncherWindow::checkUpdates);
         connect(m_btnUpdate, &QPushButton::clicked, this, &LauncherWindow::downloadUpdate);
+        connect(m_btnNotes, &QPushButton::clicked, this, &LauncherWindow::showWhatsNew);
 
         // трей
         m_tray = new QSystemTrayIcon(windowIcon(), this);
@@ -166,16 +222,41 @@ public:
         trayMenu->addAction(QStringLiteral("Запустить плеер"), this, &LauncherWindow::launchPlayer);
         trayMenu->addSeparator();
         trayMenu->addAction(QStringLiteral("Проверить обновления"), this, &LauncherWindow::checkUpdates);
+        m_actNotes = trayMenu->addAction(QStringLiteral("Что нового"));
+        m_actNotes->setEnabled(false);
+        connect(m_actNotes, &QAction::triggered, this, &LauncherWindow::showWhatsNew);
         m_actAuto = trayMenu->addAction(QStringLiteral("Авто-обновление с GitHub"));
         m_actAuto->setCheckable(true);
         m_actAuto->setChecked(m_autoUpdate);
-        connect(m_actAuto, &QAction::toggled, this, [this](bool on) {
+        // подменю отложенного запуска: когда ставить обнаруженный релиз
+        m_schedMenu = new QMenu(QStringLiteral("Отложенное авто-обновление"), trayMenu);
+        {
+            auto *grp = new QActionGroup(m_schedMenu);
+            grp->setExclusive(true);
+            const QList<int> hours = { 0, 1, 6, 24 };
+            for (int h : hours) {
+                QAction *a = m_schedMenu->addAction(h == 0 ? QStringLiteral("Сразу")
+                                                           : QStringLiteral("Через %1 ч").arg(h));
+                a->setCheckable(true);
+                a->setChecked(h == m_updateDelayHours);
+                grp->addAction(a);
+                connect(a, &QAction::triggered, this, [this, h]() { setUpdateDelay(h); });
+            }
+        }
+        QAction *schedAction = trayMenu->addMenu(m_schedMenu);
+        schedAction->setEnabled(m_autoUpdate);
+        connect(m_actAuto, &QAction::toggled, this, [this, schedAction](bool on) {
             m_autoUpdate = on;
             QSettings().setValue(QStringLiteral("autoUpdate"), on);
-            log(on ? QStringLiteral("Авто-обновление включено: новые релизы ставятся сами")
-                   : QStringLiteral("Авто-обновление выключено: обновление по кнопке"));
-            if (on)
+            schedAction->setEnabled(on);
+            if (on) {
+                log(QStringLiteral("Авто-обновление включено: новые релизы ставятся сами"));
                 maybeAutoUpdate(false);
+            } else {
+                log(QStringLiteral("Авто-обновление выключено: обновление по кнопке"));
+                cancelSchedule(QStringLiteral("Запланированная установка отменена"));
+                m_deferTimer->stop();
+            }
         });
         trayMenu->addSeparator();
         trayMenu->addAction(QStringLiteral("Выход"), qApp, &QApplication::quit);
@@ -193,6 +274,17 @@ public:
         m_deferTimer->setInterval(90 * 1000);
         connect(m_deferTimer, &QTimer::timeout, this, [this]() { maybeAutoUpdate(false); });
 
+        // отложенный запуск по расписанию: одноразовый таймер на назначенное время
+        m_schedTimer = new QTimer(this);
+        m_schedTimer->setSingleShot(true);
+        connect(m_schedTimer, &QTimer::timeout, this, [this]() {
+            m_scheduledAtMs = 0;
+            QSettings().remove(QStringLiteral("scheduledAtMs"));
+            log(QStringLiteral("Отложенное авто-обновление: подошло время ставить ")
+                + m_scheduledTag);
+            maybeAutoUpdate(false);
+        });
+
         // пока лаунчер висит в трее — перепроверяем релизы каждые 4 часа
         auto *periodic = new QTimer(this);
         periodic->setInterval(4 * 60 * 60 * 1000);
@@ -200,6 +292,7 @@ public:
         periodic->start();
 
         log(QStringLiteral("Лаунчер v") + QStringLiteral(APP_VERSION));
+        restoreSchedule();
         refreshStatusLine();
         QTimer::singleShot(400, this, &LauncherWindow::checkUpdates);
     }
@@ -318,7 +411,7 @@ private slots:
                 log(QStringLiteral("Доступна новая версия: ") + tag
                     + QStringLiteral(" — нажмите «Обновить»"));
                 if (!notes.isEmpty())
-                    log(QStringLiteral("Изменения:\n") + notes.left(600));
+                    log(QStringLiteral("Изменения:\n") + notesToPlain(notes).left(600));
             } else if (!havePlayer) {
                 m_btnUpdate->setText(QStringLiteral("Скачать плеер v") + relVer
                                      + QStringLiteral(" с GitHub"));
@@ -329,6 +422,38 @@ private slots:
                 log(QStringLiteral("У вас самая свежая версия (плеер v")
                     + (playerVer.isEmpty() ? QStringLiteral(APP_VERSION) : playerVer)
                     + QStringLiteral("), релиз на GitHub: ") + tag);
+            }
+
+            // канал уведомлений: балун «что нового» — один раз на релиз
+            const bool newer = parseVersion(tag) > parseVersion(base);
+            if (newer) {
+                if (!notes.isEmpty()) {
+                    const QString label = QStringLiteral("Что нового в v") + relVer;
+                    m_btnNotes->setText(label);
+                    m_btnNotes->show();
+                    m_actNotes->setText(label);
+                    m_actNotes->setEnabled(true);
+                }
+                if (m_notifiedTag != tag) {
+                    m_notifiedTag = tag;
+                    const QString body = notesPreview(m_remoteNotes, 180);
+                    if (!m_autoUpdate) {
+                        m_tray->showMessage(QStringLiteral("Hox v") + relVer
+                                                + QStringLiteral(" — что нового"),
+                                            body.isEmpty()
+                                                ? QStringLiteral("Доступно обновление — кнопка в окне лаунчера")
+                                                : body,
+                                            QSystemTrayIcon::Information, 10000);
+                    } else if (playerRunning()) {
+                        m_tray->showMessage(QStringLiteral("Hox v") + relVer
+                                                + QStringLiteral(" — обновлю после закрытия плеера"),
+                                            body.isEmpty()
+                                                ? QStringLiteral("Установка начнётся, когда закроете плеер")
+                                                : body,
+                                            QSystemTrayIcon::Information, 10000);
+                    }
+                    // немедленный сценарий: балун с описанием покажет maybeAutoUpdate
+                }
             }
 
             // авто-режим: релиз новее — скачиваем и ставим сами, без кнопки
@@ -433,6 +558,18 @@ private:
             return;
         const QString relVer = m_remoteTag.startsWith(QLatin1Char('v'))
                                    ? m_remoteTag.mid(1) : m_remoteTag;
+
+        // отложенный запуск по расписанию: сначала ждём назначенного времени
+        if (m_updateDelayHours > 0) {
+            if (m_scheduledTag != m_remoteTag) {
+                scheduleUpdate(m_remoteTag);   // ставим в расписание и ждём
+                return;
+            }
+            if (m_scheduledAtMs > 0)           // запланировано, время ещё не подошло
+                return;
+            // таймер сработал (m_scheduledAtMs == 0) — ставим сейчас
+        }
+
         if (playerRunning()) {
             if (!m_deferTimer->isActive()) {
                 if (fromCheck)
@@ -447,10 +584,11 @@ private:
         ++m_autoAttempts;
         log(QStringLiteral("Авто-обновление: скачиваю v") + relVer
             + QStringLiteral(" и тихо устанавливаю…"));
-        m_tray->showMessage(QStringLiteral("Hox"),
-                            QStringLiteral("Нашёл v") + relVer
-                                + QStringLiteral(" — обновляюсь автоматически"),
-                            QSystemTrayIcon::Information, 3000);
+        m_tray->showMessage(QStringLiteral("Hox v") + relVer + QStringLiteral(" — обновляюсь"),
+                            notesPreview(m_remoteNotes, 160).isEmpty()
+                                ? QStringLiteral("Скачиваю и устанавливаю новую версию")
+                                : notesPreview(m_remoteNotes, 160),
+                            QSystemTrayIcon::Information, 6000);
         QTimer::singleShot(1200, this, [this]() {
             if (!m_busy && !m_checkBusy)
                 downloadUpdate();
@@ -460,6 +598,108 @@ private:
     bool playerRunning() const
     {
         return processRunning(L"HoxPlayer.exe");
+    }
+
+    // ---------- канал уведомлений и расписание ----------
+
+    void showWhatsNew()
+    {
+        if (m_remoteNotes.isEmpty())
+            return;
+        QMessageBox box(this);
+        box.setWindowTitle(QStringLiteral("Hox v") + relVerOf(m_remoteTag)
+                           + QStringLiteral(" — что нового"));
+        box.setTextFormat(Qt::PlainText);
+        box.setText(notesToPlain(m_remoteNotes));
+        QPushButton *gh = box.addButton(QStringLiteral("Открыть на GitHub"),
+                                        QMessageBox::ActionRole);
+        box.addButton(QStringLiteral("Закрыть"), QMessageBox::RejectRole);
+        box.exec();
+        if (box.clickedButton() == gh)
+            QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/")
+                                           + QStringLiteral(GITHUB_REPO)
+                                           + QStringLiteral("/releases/tag/") + m_remoteTag));
+    }
+
+    void setUpdateDelay(int hours)
+    {
+        if (m_updateDelayHours == hours)
+            return;
+        m_updateDelayHours = hours;
+        QSettings().setValue(QStringLiteral("updateDelayHours"), hours);
+        if (hours == 0) {
+            cancelSchedule(QString());
+            log(QStringLiteral("Отложенный запуск выключен — обновляю сразу, как найду релиз"));
+            maybeAutoUpdate(false);
+            return;
+        }
+        log(QStringLiteral("Отложенный запуск: ставлю обновление через %1 ч после обнаружения релиза").arg(hours));
+        if (!m_scheduledTag.isEmpty())
+            scheduleUpdate(m_scheduledTag);   // перепланировать с текущего момента
+    }
+
+    void scheduleUpdate(const QString &tag)
+    {
+        m_scheduledTag = tag;
+        m_scheduledAtMs = QDateTime::currentMSecsSinceEpoch()
+                          + qint64(m_updateDelayHours) * 3600 * 1000;
+        QSettings s;
+        s.setValue(QStringLiteral("scheduledTag"), m_scheduledTag);
+        s.setValue(QStringLiteral("scheduledAtMs"), m_scheduledAtMs);
+        armScheduleTimer();
+        const QString when = QDateTime::fromMSecsSinceEpoch(m_scheduledAtMs)
+                                 .toString(QStringLiteral("dd.MM HH:mm"));
+        log(QStringLiteral("Отложенное авто-обновление: v") + relVerOf(tag)
+            + QStringLiteral(" установлю в ") + when);
+        m_tray->showMessage(QStringLiteral("Hox"),
+                            QStringLiteral("Обновление до v") + relVerOf(tag)
+                                + QStringLiteral(" запланировано на ") + when,
+                            QSystemTrayIcon::Information, 6000);
+    }
+
+    void armScheduleTimer()
+    {
+        if (m_scheduledAtMs <= 0)
+            return;
+        const qint64 remain =
+            qMax<qint64>(0, m_scheduledAtMs - QDateTime::currentMSecsSinceEpoch()) + 500;
+        m_schedTimer->start(int(qMin<qint64>(remain, 2147483647LL)));
+    }
+
+    // расписание переживает перезапуск лаунчера: восстанавливаем из настроек
+    void restoreSchedule()
+    {
+        QSettings s;
+        const QString tag = s.value(QStringLiteral("scheduledTag")).toString();
+        const qint64 at = s.value(QStringLiteral("scheduledAtMs")).toLongLong();
+        if (tag.isEmpty() || at <= 0)
+            return;
+        if (parseVersion(tag) <= parseVersion(QStringLiteral(APP_VERSION))) {
+            // обновление уже установлено — чистим устаревшее расписание
+            s.remove(QStringLiteral("scheduledTag"));
+            s.remove(QStringLiteral("scheduledAtMs"));
+            return;
+        }
+        m_scheduledTag = tag;
+        m_scheduledAtMs = at;
+        armScheduleTimer();
+        const QString when = QDateTime::fromMSecsSinceEpoch(at)
+                                 .toString(QStringLiteral("dd.MM HH:mm"));
+        log(QStringLiteral("Восстановлено расписание: v") + relVerOf(tag)
+            + QStringLiteral(" установлю в ") + when);
+    }
+
+    void cancelSchedule(const QString &why)
+    {
+        const bool had = (m_scheduledAtMs > 0) || !m_scheduledTag.isEmpty();
+        m_schedTimer->stop();
+        m_scheduledAtMs = 0;
+        m_scheduledTag.clear();
+        QSettings s;
+        s.remove(QStringLiteral("scheduledTag"));
+        s.remove(QStringLiteral("scheduledAtMs"));
+        if (had && !why.isEmpty())
+            log(why);
     }
 
 public:
@@ -609,12 +849,20 @@ private:
     QString m_remoteNotes;
     QString m_playerVersion;   // версия установленного плеера (если известна)
     QTimer *m_deferTimer = nullptr;   // тикает, пока авто-обновление ждёт закрытия плеера
+    QTimer *m_schedTimer = nullptr;   // одноразовый: время отложенной установки
     QAction *m_actAuto = nullptr;     // пункт трея «Авто-обновление с GitHub»
+    QAction *m_actNotes = nullptr;    // пункт трея «Что нового в vX.Y.Z»
+    QMenu *m_schedMenu = nullptr;     // подменю «Отложенное авто-обновление»
+    QPushButton *m_btnNotes = nullptr; // кнопка «Что нового» в окне
     bool m_busy = false;
     bool m_checkBusy = false;
     bool m_trayHintShown = false;
     bool m_autoUpdate = true;         // настройка «Авто-обновление с GitHub»
     int m_autoAttempts = 0;           // неудачные авто-попытки для текущего релиза
+    int m_updateDelayHours = 0;       // отложенный запуск: 0 = ставить сразу
+    QString m_scheduledTag;           // релиз, поставленный в расписание
+    qint64 m_scheduledAtMs = 0;       // время установки (epoch ms), 0 = время пришло
+    QString m_notifiedTag;            // релиз, о котором уже уведомили балуном
 };
 
 int main(int argc, char *argv[])
