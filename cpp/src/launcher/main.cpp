@@ -23,6 +23,7 @@
 #include <QSettings>
 #include <QSystemTrayIcon>
 #include <QMenu>
+#include <QAction>
 #include <QCloseEvent>
 #include <QLocalServer>
 #include <QLocalSocket>
@@ -44,6 +45,7 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #endif
 
 static constexpr const char *kReleasesApi =
@@ -66,11 +68,36 @@ static int parseVersion(const QString &v)
     return res;
 }
 
+// Запущен ли процесс с таким именем (авто-обновление не должно перебивать
+// играющий плеер).
+static bool processRunning(const wchar_t *exeName)
+{
+#ifdef Q_OS_WIN
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return false;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    bool found = false;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, exeName) == 0) { found = true; break; }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+#else
+    Q_UNUSED(exeName);
+    return false;
+#endif
+}
+
 class LauncherWindow : public QWidget {
     Q_OBJECT
 public:
     LauncherWindow() : m_net(new QNetworkAccessManager(this))
     {
+        m_autoUpdate = QSettings().value(QStringLiteral("autoUpdate"), true).toBool();
         setWindowTitle(QStringLiteral("Hox — лаунчер v") + QStringLiteral(APP_VERSION));
         setWindowIcon(QIcon(QStringLiteral(":/app.ico")));
         setFixedSize(560, 430);
@@ -138,6 +165,19 @@ public:
         trayMenu->addAction(QStringLiteral("Показать окно"), this, &LauncherWindow::showNormal);
         trayMenu->addAction(QStringLiteral("Запустить плеер"), this, &LauncherWindow::launchPlayer);
         trayMenu->addSeparator();
+        trayMenu->addAction(QStringLiteral("Проверить обновления"), this, &LauncherWindow::checkUpdates);
+        m_actAuto = trayMenu->addAction(QStringLiteral("Авто-обновление с GitHub"));
+        m_actAuto->setCheckable(true);
+        m_actAuto->setChecked(m_autoUpdate);
+        connect(m_actAuto, &QAction::toggled, this, [this](bool on) {
+            m_autoUpdate = on;
+            QSettings().setValue(QStringLiteral("autoUpdate"), on);
+            log(on ? QStringLiteral("Авто-обновление включено: новые релизы ставятся сами")
+                   : QStringLiteral("Авто-обновление выключено: обновление по кнопке"));
+            if (on)
+                maybeAutoUpdate(false);
+        });
+        trayMenu->addSeparator();
         trayMenu->addAction(QStringLiteral("Выход"), qApp, &QApplication::quit);
         m_tray->setContextMenu(trayMenu);
         m_tray->setToolTip(QStringLiteral("Hox — лаунчер"));
@@ -147,6 +187,17 @@ public:
                         showNormal();
                 });
         m_tray->show();
+
+        // отложенное авто-обновление: ждём закрытия играющего плеера
+        m_deferTimer = new QTimer(this);
+        m_deferTimer->setInterval(90 * 1000);
+        connect(m_deferTimer, &QTimer::timeout, this, [this]() { maybeAutoUpdate(false); });
+
+        // пока лаунчер висит в трее — перепроверяем релизы каждые 4 часа
+        auto *periodic = new QTimer(this);
+        periodic->setInterval(4 * 60 * 60 * 1000);
+        connect(periodic, &QTimer::timeout, this, &LauncherWindow::checkUpdates);
+        periodic->start();
 
         log(QStringLiteral("Лаунчер v") + QStringLiteral(APP_VERSION));
         refreshStatusLine();
@@ -177,7 +228,7 @@ private slots:
         if (QFileInfo::exists(playerPath())) {
             const QString v = m_playerVersion.isEmpty()
                                   ? QString() : QStringLiteral(" — v") + m_playerVersion;
-            m_status->setText(QStringLiteral("Плеер установлен%1. Обновления лаунчер проверяет сам.").arg(v));
+            m_status->setText(QStringLiteral("Плеер установлен%1. Обновления лаунчер проверяет сам и ставит автоматически.").arg(v));
             m_btnPlay->setEnabled(true);
         } else {
             m_status->setText(QStringLiteral(
@@ -230,6 +281,8 @@ private slots:
                 log(QStringLiteral("Не удалось прочитать ответ GitHub"));
                 return;
             }
+            if (tag != m_remoteTag)
+                m_autoAttempts = 0;   // новый релиз — счётчик авто-попыток заново
             m_remoteTag = tag;
             m_remoteNotes = notes;
 
@@ -277,6 +330,9 @@ private slots:
                     + (playerVer.isEmpty() ? QStringLiteral(APP_VERSION) : playerVer)
                     + QStringLiteral("), релиз на GitHub: ") + tag);
             }
+
+            // авто-режим: релиз новее — скачиваем и ставим сами, без кнопки
+            maybeAutoUpdate(true);
         });
     }
 
@@ -360,6 +416,52 @@ private:
         return reg.value(QStringLiteral("DisplayVersion")).toString().trimmed();
     }
 
+    // Авто-обновление: релиз новее установленного плеера — скачиваем и ставим
+    // сами, без кнопки. Плеер сейчас играет? Ждём его закрытия (m_deferTimer).
+    // Первую установку (плеера ещё нет) оставляем пользователю — по кнопке.
+    void maybeAutoUpdate(bool fromCheck)
+    {
+        if (!m_autoUpdate || m_busy || m_checkBusy || m_remoteTag.isEmpty())
+            return;
+        if (m_autoAttempts >= 3)   // три неудачи подряд — ждём следующей проверки
+            return;
+        if (!QFileInfo::exists(playerPath()))
+            return;
+        const QString base = m_playerVersion.isEmpty() ? QStringLiteral(APP_VERSION)
+                                                       : m_playerVersion;
+        if (parseVersion(m_remoteTag) <= parseVersion(base))
+            return;
+        const QString relVer = m_remoteTag.startsWith(QLatin1Char('v'))
+                                   ? m_remoteTag.mid(1) : m_remoteTag;
+        if (playerRunning()) {
+            if (!m_deferTimer->isActive()) {
+                if (fromCheck)
+                    log(QStringLiteral("Плеер сейчас играет — обновлю до v") + relVer
+                        + QStringLiteral(" автоматически, как только он будет закрыт."));
+                m_deferTimer->start();
+            }
+            return;
+        }
+        if (m_deferTimer->isActive())
+            m_deferTimer->stop();
+        ++m_autoAttempts;
+        log(QStringLiteral("Авто-обновление: скачиваю v") + relVer
+            + QStringLiteral(" и тихо устанавливаю…"));
+        m_tray->showMessage(QStringLiteral("Hox"),
+                            QStringLiteral("Нашёл v") + relVer
+                                + QStringLiteral(" — обновляюсь автоматически"),
+                            QSystemTrayIcon::Information, 3000);
+        QTimer::singleShot(1200, this, [this]() {
+            if (!m_busy && !m_checkBusy)
+                downloadUpdate();
+        });
+    }
+
+    bool playerRunning() const
+    {
+        return processRunning(L"HoxPlayer.exe");
+    }
+
 public:
     // Запуск после тихого обновления: окно не показываем — сворачиваемся
     // в трей и стартуем обновлённый плеер.
@@ -437,9 +539,11 @@ private:
             return;
         }
         f.close();
-        log(QStringLiteral("Запускаю тихую установку (запрос прав администратора)…"));
+        log(QStringLiteral("Запускаю тихую установку…"));
 
-        // установка требует UAC — запускаем через runas и ждём в отдельном потоке
+        // Установщик работает с правами пользователя (RequestExecutionLevel
+        // user): UAC запрашивается только внутри — когда не хватает VC++
+        // Redistributable. Обновление на живой системе проходит без UAC.
         const std::wstring file = QDir::toNativeSeparators(setupPath).toStdWString();
         const std::wstring params =
             (QStringLiteral("/S /D=")
@@ -469,7 +573,7 @@ private:
 #ifdef Q_OS_WIN
             SHELLEXECUTEINFOW sei{};
             sei.cbSize = sizeof(sei);
-            sei.lpVerb = L"runas";
+            sei.lpVerb = L"open";
             sei.lpFile = file.c_str();
             sei.lpParameters = params.c_str();
             sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_DDEWAIT;
@@ -504,9 +608,13 @@ private:
     QString m_remoteTag;
     QString m_remoteNotes;
     QString m_playerVersion;   // версия установленного плеера (если известна)
+    QTimer *m_deferTimer = nullptr;   // тикает, пока авто-обновление ждёт закрытия плеера
+    QAction *m_actAuto = nullptr;     // пункт трея «Авто-обновление с GitHub»
     bool m_busy = false;
     bool m_checkBusy = false;
     bool m_trayHintShown = false;
+    bool m_autoUpdate = true;         // настройка «Авто-обновление с GitHub»
+    int m_autoAttempts = 0;           // неудачные авто-попытки для текущего релиза
 };
 
 int main(int argc, char *argv[])
