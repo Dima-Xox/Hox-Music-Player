@@ -79,10 +79,30 @@ jobs:
         run: |
           # welcome-страница MUI — стандартная, битмап не требуется
 
-          choco install nsis -y --no-progress
-          $mk = Get-ChildItem "C:\Program Files*\NSIS\makensis.exe" -ErrorAction SilentlyContinue |
-                Select-Object -First 1 -ExpandProperty FullName
-          if (-not $mk) { throw "makensis not found after choco install" }
+          # choco бывает недоступен (503 от community.chocolatey.org) —
+          # ретраи + резервный путь: официальный zip NSIS с SourceForge
+          $mk = $null
+          foreach ($attempt in 1..2) {
+            choco install nsis -y --no-progress
+            $mk = Get-ChildItem "C:\Program Files*\NSIS\makensis.exe" -ErrorAction SilentlyContinue |
+                  Select-Object -First 1 -ExpandProperty FullName
+            if ($mk) { break }
+            Write-Host "попытка $attempt не удалась, повтор через 20 сек…"
+            Start-Sleep -Seconds 20
+          }
+          if (-not $mk) {
+            Write-Host "choco недоступен — качаю официальный zip NSIS"
+            foreach ($v in @('3.13','3.12','3.11')) {
+              curl.exe -sSL -o nsis.zip "https://downloads.sourceforge.net/project/nsis/NSIS%203/$v/nsis-$v.zip"
+              if ((Test-Path nsis.zip) -and ((Get-Item nsis.zip).Length -gt 2MB)) {
+                Expand-Archive nsis.zip -DestinationPath nsis-portable -Force
+                $mk = Get-ChildItem -Path nsis-portable -Recurse -Filter makensis.exe |
+                      Select-Object -First 1 -ExpandProperty FullName
+                if ($mk) { break }
+              }
+            }
+          }
+          if (-not $mk) { throw "makensis не найден (choco и SourceForge недоступны)" }
           Write-Host "makensis: $mk"
           $ver = "${{ steps.ver.outputs.version }}"
           $bytes = (Get-ChildItem deploy -Recurse -File | Measure-Object Length -Sum).Sum
