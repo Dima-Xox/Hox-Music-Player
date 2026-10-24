@@ -13,7 +13,11 @@ fn main() {
         // (в src/main.rs код не трогаем — подсистему задаём флагом линкера)
         match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
             Ok("gnu") => println!("cargo:rustc-link-arg-bins=-mwindows"),
-            Ok("msvc") => println!("cargo:rustc-link-arg-bins=/SUBSYSTEM:WINDOWS"),
+            Ok("msvc") => {
+                println!("cargo:rustc-link-arg-bins=/SUBSYSTEM:WINDOWS");
+                // main() вместо WinMain: без этого libcmt ищет WinMain (LNK2019)
+                println!("cargo:rustc-link-arg-bins=/ENTRY:mainCRTStartup");
+            }
             _ => {}
         }
     }
