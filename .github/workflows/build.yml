@@ -12,75 +12,51 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: '6.8.1'
-          arch: win64_msvc2022_64
-          modules: 'qtmultimedia qtimageformats'
-          cache: true
+      - name: Install Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Read version
         id: ver
-        shell: pwsh
         run: |
-          $h = Get-Content cpp/src/common/version.h -Raw
-          if ($h -match '#define APP_VERSION "(.+?)"') {
+          $rs = Get-Content rust\common\src\lib.rs -Raw
+          if ($rs -match 'APP_VERSION:\s*&str\s*=\s*"(.+?)"') {
             "version=$($Matches[1])" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           } else { throw "APP_VERSION not found" }
 
-      - name: Configure
-        shell: pwsh
-        run: cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build
-        shell: pwsh
-        run: cmake --build build --config Release --parallel
-
-      - name: Deploy Qt runtime (windeployqt)
-        shell: pwsh
+      - name: Build (release, static CRT)
         run: |
-          $wqt = Join-Path $env:QT_ROOT_DIR 'bin\windeployqt.exe'
-          if (-not (Test-Path $wqt)) { throw "windeployqt not found: $wqt" }
-          & $wqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw --no-quick-import "build\bin\HoxPlayer.exe"
-          & $wqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw --no-quick-import "build\bin\HoxLauncher.exe"
-          if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
+          $env:RUSTFLAGS = "-C target-feature=+crt-static"
+          cargo build --release --workspace --manifest-path rust/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
       - name: Selfcheck (CI smoke)
-        shell: pwsh
         run: |
-          Get-ChildItem build\bin | Out-Host
-          $tests = @('build\bin\HoxPlayer.exe', 'build\bin\HoxLauncher.exe')
+          $tests = @('rust\target\release\HoxPlayer.exe', 'rust\target\release\HoxLauncher.exe')
           foreach ($t in $tests) {
             if (-not (Test-Path $t)) { throw "not found: $t" }
             $p = Start-Process -FilePath (Resolve-Path $t) -ArgumentList '--selfcheck' -Wait -PassThru -NoNewWindow
             Write-Host "$t exit code: $($p.ExitCode)"
             if ($p.ExitCode -ne 0) { throw "$t selfcheck failed: $($p.ExitCode)" }
           }
+          $v = Start-Process -FilePath (Resolve-Path 'rust\target\release\HoxPlayer.exe') -ArgumentList '--version' -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\hoxver.txt"
+          Get-Content "$env:TEMP\hoxver.txt" | Out-Host
+
       - name: Assemble payload
-        shell: pwsh
         run: |
           New-Item -ItemType Directory -Force deploy\bin | Out-Null
-          Copy-Item build\bin\* deploy\bin\ -Recurse -Force
-          Copy-Item cpp\res\hox.ico deploy\bin\hox.ico -Force
-          New-Item -ItemType Directory -Force deploy\redist | Out-Null
-          curl.exe -sSL -o deploy\redist\vc_redist.x64.exe https://aka.ms/vs/17/release/vc_redist.x64.exe
-          curl.exe -sSL -o deploy\redist\vc_redist.x86.exe https://aka.ms/vs/17/release/vc_redist.x86.exe
-          $x64 = (Get-Item deploy\redist\vc_redist.x64.exe).Length
-          $x86 = (Get-Item deploy\redist\vc_redist.x86.exe).Length
-          if ($x64 -lt 1000000 -or $x86 -lt 1000000) { throw "vc_redist download too small: $x64 / $x86" }
-          "Redists: x64=$x64 x86=$x86" | Out-Host
+          Copy-Item rust\target\release\HoxPlayer.exe deploy\bin\ -Force
+          Copy-Item rust\target\release\HoxLauncher.exe deploy\bin\ -Force
+          Copy-Item rust\player\assets\hox.ico deploy\bin\hox.ico -Force
+          Get-ChildItem deploy -Recurse | Out-Host
 
       - name: Install NSIS and build installer
-        shell: pwsh
         run: |
-          # welcome-страница MUI — стандартная, битмап не требуется
-
-          # choco бывает недоступен (503 от community.chocolatey.org) —
-          # ретраи + резервный путь: официальный zip NSIS с SourceForge
           $mk = $null
           foreach ($attempt in 1..2) {
             choco install nsis -y --no-progress
@@ -109,14 +85,13 @@ jobs:
           $kb = [int]($bytes / 1KB)
           & $mk /INPUTCHARSET UTF8 /DVERSION=$ver /DPAYLOAD="$env:GITHUB_WORKSPACE\deploy" `
             /DOUTFILE="$env:GITHUB_WORKSPACE\Hox-Setup-$ver.exe" /DESTSIZE=$kb `
-            installer\hox-setup-cpp.nsi
+            installer\hox-setup-rust.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
           $h2 = (Get-FileHash "Hox-Setup-$ver.exe" -Algorithm SHA256).Hash.ToLower()
           "$h2  Hox-Setup-$ver.exe" | Out-File -NoNewline "Hox-Setup-$ver.exe.sha256" -Encoding ascii
           Get-Content "Hox-Setup-$ver.exe.sha256"
 
       - name: Portable zip
-        shell: pwsh
         run: |
           $ver = "${{ steps.ver.outputs.version }}"
           Compress-Archive -Path deploy\bin\* -DestinationPath "Hox-Player-$ver.zip" -Force
@@ -137,7 +112,6 @@ jobs:
 
       - name: Extract release notes
         if: startsWith(github.ref, 'refs/tags/')
-        shell: pwsh
         run: |
           $ver = "${{ steps.ver.outputs.version }}"
           $md = Get-Content CHANGELOG.md -Raw

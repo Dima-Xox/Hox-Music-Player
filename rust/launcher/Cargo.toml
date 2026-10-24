@@ -1,0 +1,25 @@
+[package]
+name = "hoxlauncher"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "HoxLauncher"
+path = "src/main.rs"
+
+[dependencies]
+hox-common.workspace = true
+eframe.workspace = true
+egui.workspace = true
+image.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+sha2.workspace = true
+winreg.workspace = true
+regex.workspace = true
+
+[build-dependencies]
+winresource = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

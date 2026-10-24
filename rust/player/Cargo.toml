@@ -1,0 +1,30 @@
+[package]
+name = "hoxplayer"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "HoxPlayer"
+path = "src/main.rs"
+
+[dependencies]
+hox-common.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+image.workspace = true
+rodio.workspace = true
+lofty.workspace = true
+encoding_rs.workspace = true
+regex.workspace = true
+rfd.workspace = true
+winreg.workspace = true
+
+[build-dependencies]
+winresource = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[package.metadata.notes]
+app = "player"

@@ -15,3 +15,6 @@ Thumbs.db
 
 # Локальная конфигурация с токеном — НИКОГДА не коммитить
 scripts/gh_config.env
+
+# Rust
+target/

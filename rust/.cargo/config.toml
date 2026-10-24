@@ -1,0 +1,4 @@
+[target.x86_64-pc-windows-gnu]
+# Линкер — MinGW-w64, распакованный dpkg -x в artifacts/mingw-root (PATH задаёт preflight)
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = ["-C", "link-arg=-static-libgcc"]

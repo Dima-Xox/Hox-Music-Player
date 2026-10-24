@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = ["common", "player", "launcher"]
+
+[workspace.package]
+version = "0.6.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+hox-common = { path = "common" }
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.31"
+egui_extras = "0.31"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "ico", "bmp", "gif", "webp"] }
+rodio = { version = "0.20", default-features = false, features = [
+    "symphonia-mp3", "symphonia-flac", "symphonia-vorbis",
+    "symphonia-wav", "symphonia-aac", "symphonia-isomp4",
+] }
+lofty = "0.22"
+encoding_rs = "0.8"
+regex = "1"
+rfd = "0.15"
+winreg = "0.55"
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["tls", "gzip", "json"] }
+sha2 = "0.10"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+] }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
+codegen-units = 16
